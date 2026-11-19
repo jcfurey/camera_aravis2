@@ -102,7 +102,7 @@ class CameraDriverGv : public CameraDriver
 
     /**
      * @brief Callback method to inject short processing routines after the
-     * publication of each frame, e.g. check state of PTP.
+     * publication of each frame.
      *
      * This is called within the processing loop of processStreamBuffer.
      *
@@ -113,11 +113,7 @@ class CameraDriverGv : public CameraDriver
      */
     void postFrameProcessingCallback(const uint stream_id) override;
 
-    /**
-     * @brief Check the status of the Precision Time Protocol and reset its clock if applicable.     *
-     * The clock will only be reset if the status of PTP is "Faulty", "Disabled", or
-     * "Initializing".
-     */
+    /// Sample the PTP data set once for all streams.
     void checkPtpState();
 
     //--- MEMBER DECLARATION ---//

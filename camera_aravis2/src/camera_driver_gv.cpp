@@ -63,6 +63,22 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
     buffer_desc.integer_range.push_back(buffer_range);
     declare_parameter<int64_t>("stream_socket_buffer_size", 0, buffer_desc);
 
+    rcl_interfaces::msg::ParameterDescriptor ptp_desc;
+    ptp_desc.read_only = true;
+    ptp_desc.description = "Maximum absolute slave offset for PTP lock in nanoseconds.";
+    const auto tolerance = declare_parameter<int64_t>("ptp_max_offset_ns", 100000, ptp_desc);
+    ptp_desc.description = "Seconds of continuously good PTP observations required for lock.";
+    const auto window = declare_parameter<int64_t>("ptp_offset_window_s", 5, ptp_desc);
+    ptp_desc.description = "Maximum skew in seconds between corrected PTP and host reception.";
+    const auto skew_s = declare_parameter<double>("ptp_max_host_skew_s", 1.0, ptp_desc);
+    const auto skew = timestampOffsetNs(skew_s);
+    if (tolerance < 0 || window < 0 || !skew || skew_s < 0)
+    {
+        RCLCPP_ERROR(logger_, "Invalid PTP tolerance, lock window or host skew");
+        return;
+    }
+    ptp_max_host_skew_ns_ = static_cast<uint64_t>(*skew);
+
     is_verbose_enable_ = get_parameter("verbose").as_bool();
 
     //--- get parameter overrides, i.e. all parameters, including those that are not declared
@@ -92,6 +108,12 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
     timestamp_source_ = timestampSource(get_parameter("timestamp_mode").as_string(),
                                         p_gv_tl_control_->is_ptp_enable);
 
+    if (timestamp_source_ == TimestampSource::Ptp && !p_gv_tl_control_->is_ptp_enable)
+    {
+        RCLCPP_ERROR(logger_, "timestamp_mode=ptp requires PtpEnable to be true on the camera");
+        return;
+    }
+
     //--- set image format control settings
     CHECK_SUCCESS(setImageFormatControlSettings(), logger_);
 
@@ -111,15 +133,35 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
     setupCameraDiagnosticPublisher();
 
     //--- check ptp
-    if (p_gv_tl_control_ && p_gv_tl_control_->is_ptp_enable)
+    if (p_gv_tl_control_->is_ptp_enable)
+    {
+        ptp_lock_.emplace(std::chrono::seconds(window), tolerance);
         checkPtpState();
+        p_gv_tl_control_->ptp_status = ptp_lock_->sample().status;
+    }
 
     //--- print currently applied camera configuration
     printCameraConfiguration();
 
     //--- spawn camera stream in thread, so that initialization is not blocked
     is_spawning_         = true;
-    spawn_stream_thread_ = std::thread(&CameraDriverGv::spawnCameraStreams, this);
+    spawn_stream_thread_ = std::thread([this]()
+    {
+        spawnCameraStreams();
+        if (!isInitialized() || !ptp_lock_)
+            return;
+
+        // Keep polling on the startup thread so slow camera reads do not block the
+        // executor or frame processing. stopCameraStreams wakes and joins this thread.
+        std::unique_lock<std::mutex> lock(ptp_mutex_);
+        while (!ptp_wakeup_.wait_for(lock, std::chrono::seconds(1),
+                                     [this]() { return stop_ptp_polling_; }))
+        {
+            lock.unlock();
+            checkPtpState();
+            lock.lock();
+        }
+    });
 }
 
 //==================================================================================================
@@ -270,38 +312,44 @@ void CameraDriverGv::tuneArvStream(ArvStream* p_stream) const
 void CameraDriverGv::postFrameProcessingCallback(const uint stream_id)
 {
     RCL_UNUSED(stream_id);
-
-    if (p_gv_tl_control_ && p_gv_tl_control_->is_ptp_enable)
-        checkPtpState();
 }
 
 //==================================================================================================
 void CameraDriverGv::checkPtpState()
 {
-    //--- get status
-    getFeatureValue<std::string>("PtpStatus", p_gv_tl_control_->ptp_status);
-
-    //--- check if clock needs reset
-    if (p_gv_tl_control_->ptp_status == "Faulty" ||
-        p_gv_tl_control_->ptp_status == "Disabled" ||
-        p_gv_tl_control_->ptp_status == "Initializing" ||
-        p_gv_tl_control_->ptp_status == "Uncalibrated")
+    const auto start = PtpLock::Clock::now();
+    PtpSample sample;
+    const bool latched = !arv_device_get_feature(p_device_, "PtpDataSetLatch") ||
+      executeCommand("PtpDataSetLatch");
+    std::string status;
+    if (latched && getFeatureValue("PtpStatus", status))
+        sample.status = status;
+    if (sample.status == "Slave")
     {
-        RCLCPP_INFO_EXPRESSION(logger_, is_verbose_enable_,
-                               "PTP Status: %s. Resetting PTP clock.",
-                               p_gv_tl_control_->ptp_status.c_str());
-
-        setFeatureValue<bool>("PtpEnable", false);
-        setFeatureValue<bool>("PtpEnable", true);
-
-        executeCommand("PtpDataSetLatch");
-
-        getFeatureValue<std::string>("PtpStatus", p_gv_tl_control_->ptp_status);
-
-        RCLCPP_INFO_EXPRESSION(logger_, is_verbose_enable_,
-                               "New PTP Status: %s.",
-                               p_gv_tl_control_->ptp_status.c_str());
+        int64_t offset = 0;
+        if (getFeatureValue("PtpOffsetFromMaster", offset))
+        {
+            // LUCID uses -1 for an unavailable offset. Other cameras can report -1 ns
+            // as a valid signed offset.
+            if (offset != -1)
+                sample.offset_ns = offset;
+            else
+            {
+                const char* vendor = arv_camera_get_vendor_name(p_camera_, nullptr);
+                if (vendor && g_ascii_strncasecmp(vendor, "Lucid", 5) != 0)
+                    sample.offset_ns = offset;
+            }
+        }
+        if (arv_device_get_feature(p_device_, "PtpServoStatus"))
+        {
+            std::string servo;
+            sample.servo_status = getFeatureValue("PtpServoStatus", servo) ? servo : "Unknown";
+        }
     }
+    const auto wall = std::chrono::system_clock::now().time_since_epoch();
+    const auto host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(wall).count();
+    std::lock_guard<std::mutex> lock(ptp_mutex_);
+    ptp_lock_->observe(std::move(sample), start, host_ns);
 }
 
 }  // end namespace camera_aravis2

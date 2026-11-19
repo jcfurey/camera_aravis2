@@ -184,7 +184,7 @@ void CameraDriver::setupParameters()
 
     rcl_interfaces::msg::ParameterDescriptor mode_desc;
     mode_desc.read_only = true;
-    mode_desc.description = "Frame timestamp mode: auto, host_receive, device or device_offset.";
+    mode_desc.description = "Frame clock: auto, host_receive, device, device_offset or ptp.";
     const auto mode = declare_parameter<std::string>("timestamp_mode", "auto", mode_desc);
     timestamp_source_ = timestampSource(mode, false);
 
@@ -1957,8 +1957,15 @@ bool CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_im
     // Read the committed parameter so an unsuccessful atomic parameter update cannot
     // change the frame offset. The declaration and set callback validate the conversion.
     const auto offset = timestampOffsetNs(get_parameter("timestamp_offset").as_double()).value();
+    const auto receive = arv_buffer_get_system_timestamp(p_buffer);
+    if (timestamp_source_ == TimestampSource::Ptp)
+    {
+        std::lock_guard<std::mutex> lock(ptp_mutex_);
+        if (!ptp_lock_ || !ptp_lock_->covers(receive, PtpLock::Clock::now()))
+            return false;
+    }
     const auto stamp = stream.frame_timestamp.stamp(timestamp_source_,
-      arv_buffer_get_timestamp(p_buffer), arv_buffer_get_system_timestamp(p_buffer), offset);
+      arv_buffer_get_timestamp(p_buffer), receive, offset, ptp_max_host_skew_ns_);
     if (!stamp)
         return false;
     p_img_msg->header.stamp = rclcpp::Time(*stamp);
@@ -2267,8 +2274,13 @@ void CameraDriver::stopCameraStreams()
     // Guarded error object
     GuardedGError err;
 
-    //--- join spawning thread
+    //--- stop stream setup and any subsequent GigE PTP polling
     is_spawning_ = false;
+    {
+        std::lock_guard<std::mutex> lock(ptp_mutex_);
+        stop_ptp_polling_ = true;
+    }
+    ptp_wakeup_.notify_one();
     if (spawn_stream_thread_.joinable())
         spawn_stream_thread_.join();
 

@@ -49,6 +49,11 @@ CameraDriverUv::CameraDriverUv(const rclcpp::NodeOptions& options) :
 {
     //--- setup parameters
     setupParameters();
+    if (timestamp_source_ == TimestampSource::Ptp)
+    {
+        RCLCPP_ERROR(logger_, "timestamp_mode=ptp requires a PTP-enabled GigE camera");
+        return;
+    }
 
     is_verbose_enable_ = get_parameter("verbose").as_bool();
 

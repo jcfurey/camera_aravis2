@@ -37,12 +37,18 @@ namespace camera_aravis2
 
 namespace
 {
-template <typename T>
-void addValue(diagnostic_msgs::msg::DiagnosticStatus& status, const char* key, T value)
+void addText(diagnostic_msgs::msg::DiagnosticStatus& status, const char* key,
+             const std::string& value)
 {
     auto& entry = status.values.emplace_back();
     entry.key = key;
-    entry.value = std::to_string(value);
+    entry.value = value;
+}
+
+template <typename T>
+void addValue(diagnostic_msgs::msg::DiagnosticStatus& status, const char* key, T value)
+{
+    addText(status, key, std::to_string(value));
 }
 }  // namespace
 
@@ -132,9 +138,26 @@ void CameraDriver::publishStreamDiagnostics()
                 status = counters.describeInterval(stream.previous_counters, interval,
                                                    current_num_subscribers_ > 0,
                                                    ARV_IS_GV_STREAM(stream.p_arv_stream));
-                auto& source = status.values.emplace_back();
-                source.key = "timestamp_source";
-                source.value = timestampSourceName(timestamp_source_);
+                addText(status, "timestamp_source", timestampSourceName(timestamp_source_));
+                if (ptp_lock_)
+                {
+                    std::lock_guard<std::mutex> clock_guard(ptp_mutex_);
+                    const auto& ptp = ptp_lock_->sample();
+                    const bool locked = ptp_lock_->locked(PtpLock::Clock::now());
+                    addText(status, "ptp_status", ptp.status);
+                    addText(status, "ptp_locked", locked ? "true" : "false");
+                    addText(status, "ptp_servo_status", ptp.servo_status.value_or("unavailable"));
+                    addText(status, "ptp_offset_ns",
+                      ptp.offset_ns ? std::to_string(*ptp.offset_ns) : "unavailable");
+                    if (timestamp_source_ == TimestampSource::Ptp && !locked &&
+                        current_num_subscribers_ > 0)
+                    {
+                        status.message = status.level == Status::WARN ?
+                          status.message + " (waiting for PTP slave lock)" :
+                          "Waiting for PTP slave lock";
+                        status.level = Status::WARN;
+                    }
+                }
                 addValue(status, "processing_queue_depth", stream.buffer_queue.size());
                 addValue(status, "buffers_allocated", stream.p_buffer_pool->getAllocatedSize());
                 addValue(status, "buffer_limit", max_stream_buffers_);

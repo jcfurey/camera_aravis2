@@ -48,6 +48,7 @@ TEST(FrameTimestamp, AutoFollowsPtpAndExplicitModesTakePrecedence)
         EXPECT_EQ(timestampSource("host_receive", ptp), TimestampSource::HostReceive);
         EXPECT_EQ(timestampSource("device", ptp), TimestampSource::Device);
         EXPECT_EQ(timestampSource("device_offset", ptp), TimestampSource::DeviceOffset);
+        EXPECT_EQ(timestampSource("ptp", ptp), TimestampSource::Ptp);
     }
     EXPECT_THROW(timestampSource("typo", false), std::invalid_argument);
 }
@@ -105,6 +106,68 @@ TEST(FrameTimestamp, ChecksOffsetAndMessageBoundsBeforeAddingOrNarrowing)
     EXPECT_FALSE(timestampOffsetNs(std::numeric_limits<double>::quiet_NaN()));
     EXPECT_FALSE(timestampOffsetNs(std::numeric_limits<double>::infinity()));
     EXPECT_FALSE(timestampOffsetNs(1e20));
+}
+
+TEST(PtpClock, LockRequiresContinuousFreshSlaveObservationsAndRejectsOlderBuffers)
+{
+    using namespace std::chrono_literals;
+    PtpLock lock(2s, 100);
+    const PtpLock::Clock::time_point start{};
+    const PtpSample slave{"Slave", "Locked", -100};
+    EXPECT_FALSE(lock.locked(start));
+    lock.observe(slave, start, 1000);
+    EXPECT_FALSE(lock.locked(start));
+    lock.observe(slave, start + 1s, 2000);
+    lock.observe(slave, start + 2s, 3000);
+    EXPECT_TRUE(lock.locked(start + 2s));
+    EXPECT_FALSE(lock.covers(2999, start + 2s));
+    EXPECT_TRUE(lock.covers(3000, start + 2s));
+    EXPECT_FALSE(lock.locked(start + 5s));
+    lock.observe(slave, start + 6s, 7000);
+    EXPECT_FALSE(lock.locked(start + 6s));
+    lock.observe(slave, start + 8s, 9000);
+    EXPECT_TRUE(lock.covers(9000, start + 8s));
+    lock.observe({"Listening", {}, {}}, start + 9s, 10000);
+    EXPECT_FALSE(lock.covers(10000, start + 9s));
+    lock.observe(slave, start + 10s, 11000);
+    lock.observe(slave, start + 12s, 13000);
+    EXPECT_FALSE(lock.covers(12000, start + 12s));
+}
+
+TEST(PtpClock, EvaluatesRoleOptionalServoAndSignedOffset)
+{
+    using namespace std::chrono_literals;
+    EXPECT_THROW(PtpLock(0s, INT64_MIN), std::invalid_argument);
+    EXPECT_THROW(PtpLock(-1s, 0), std::invalid_argument);
+    PtpLock lock(0s, 100);
+    const auto now = PtpLock::Clock::now();
+    for (const auto& bad : {PtpSample{"Master", "Locked", 0},
+                            PtpSample{"Slave", {}, {}},
+                            PtpSample{"Slave", "Converging", 0},
+                            PtpSample{"Unknown", {}, 0},
+                            PtpSample{"Slave", {}, INT64_MIN},
+                            PtpSample{"Slave", "Locked", 101}})
+    {
+        lock.observe({"Slave", {}, 100}, now, 1000);
+        EXPECT_TRUE(lock.locked(now));
+        lock.observe(bad, now, 1001);
+        EXPECT_FALSE(lock.locked(now));
+    }
+}
+
+TEST(FrameTimestamp, PtpChecksCorrectedEpochAndIncreasingStamps)
+{
+    constexpr auto ptp = TimestampSource::Ptp;
+    FrameTimestamp clock;
+    EXPECT_FALSE(clock.stamp(ptp, 0, 1000, 1000, 10));
+    EXPECT_FALSE(clock.stamp(ptp, 1000, 0, 0, 10));
+    EXPECT_FALSE(clock.stamp(ptp, 5011, 1000, -4000, 10));
+    EXPECT_FALSE(clock.stamp(ptp, 4989, 1000, -4000, 10));
+    EXPECT_EQ(clock.stamp(ptp, 4990, 1000, -4000, 10), 990);
+    EXPECT_FALSE(clock.stamp(ptp, 4990, 1000, -4000, 10));
+    EXPECT_FALSE(clock.stamp(ptp, 4989, 999, -4000, 10));
+    EXPECT_FALSE(clock.stamp(ptp, UINT64_MAX, 1000, 0, 10));
+    EXPECT_EQ(clock.stamp(ptp, 5010, 1000, -4000, 10), 1010);
 }
 
 }  // namespace

@@ -73,6 +73,7 @@ The configuration of the camera driver is divided into a driver-specific and Gen
     - `auto` (default) uses device time when the GigE camera reports PTP enabled at startup and host reception time otherwise. Enabling PTP alone does not establish clock lock or epoch agreement.
     - `host_receive` uses the host wall-clock timestamp Aravis records when receiving the buffer.
     - `device` forwards the camera's raw frame timestamp. The camera determines its epoch and it can jump after a clock reset.
+    - `ptp` uses corrected camera time after a GigE camera qualifies as a synchronized PTP slave. See [How to use PTP](#how-to-use-ptp) for the lock and epoch checks.
     - `device_offset` anchors the first device timestamp of each stream to host reception time. Subsequent stamps follow device intervals, bounded by the receive time, with up to 100 ppm of upward drift correction. A backward step of either clock reanchors that stream. This provides approximate host alignment.
 - `timestamp_offset` adds a signed number of seconds to the selected timestamp (default 0.0, writable during streaming). Frames outside the nonnegative ROS message time range are dropped. In `device_offset` mode a zero input timestamp, duplicate device tick, or repeated aligned stamp also drops the frame. Stream diagnostics expose the effective `timestamp_source` and cumulative `timestamp_drops`. A new timestamp drop raises WARN for that interval.
 - `max_stream_buffers` caps the Aravis receive buffers per stream (default 32, minimum 2). Each stream initially allocates up to ten payload-sized buffers and grows on demand. At the limit, if the input queue is empty, the driver recycles the newest complete frame so the receiver has a buffer for the next frame. Frames already queued retain their order.
@@ -329,19 +330,18 @@ colcon test-result --all
 
 *GigEVision Cameras Only*
 
-Some GigEVision cameras support the use of the Precision Time Protocol (PTP) to set the timestamps of the captured images. To activate and use it just set the launch parameter 'TransportLayerControl.PtpEnable' to 'True' as seen blow:
+For a camera synchronized to an external grandmaster, select `timestamp_mode:=ptp` and enable `TransportLayerControl.PtpEnable`. A camera with PTP already enabled also works. The driver checks the actual enable state at startup.
 
-```Python
-    ...
-    parameters=[{
-                    ...
-                    "TransportLayerControl": {
-                        "PtpEnable": True
-                    }
-                    ...
-                }]
-    ...
+```bash
+ros2 run camera_aravis2 camera_driver_gv --ros-args -p guid:=10.2.2.28 \
+  -p TransportLayerControl.PtpEnable:=true -p timestamp_mode:=ptp
 ```
+
+The driver samples the PTP data set once per second, including while acquisition is idle. A qualifying sample has role `Slave`, an available `PtpOffsetFromMaster` within `ptp_max_offset_ns` (default 100000 ns), and a locked servo if the camera exposes `PtpServoStatus`. An unknown offset prevents lock. The driver latches the data set when the camera supports it and leaves clock recovery to the camera.
+
+Good samples must span `ptp_offset_window_s` (default 5 seconds). A failed observation or a gap longer than two seconds invalidates lock. Only frames received after qualification are eligible. Detection of hardware lock loss is limited by the polling interval.
+
+Each corrected camera timestamp must increase and lie within `ptp_max_host_skew_s` (default 1 second) of Aravis host wall-clock reception. Configure `timestamp_offset` for the grandmaster's time scale when needed. Rejected frames count toward `timestamp_drops`. Stream diagnostics report `ptp_status`, `ptp_servo_status`, `ptp_offset_ns` and `ptp_locked` on PTP-enabled cameras. The three PTP thresholds are startup parameters. On PTP-enabled GigE cameras the `auto` and `device` modes publish raw device time independently of these checks.
 
 ### How to set specific analog control values (e.g. balance ratios)
 

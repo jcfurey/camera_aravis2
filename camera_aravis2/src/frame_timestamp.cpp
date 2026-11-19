@@ -33,6 +33,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace camera_aravis2
 {
@@ -41,6 +42,7 @@ const char* timestampSourceName(TimestampSource source)
 {
     switch (source)
     {
+    case TimestampSource::Ptp: return "ptp";
     case TimestampSource::Device: return "device";
     case TimestampSource::DeviceOffset: return "device_offset";
     case TimestampSource::HostReceive: return "host_receive";
@@ -53,11 +55,11 @@ TimestampSource timestampSource(const std::string& mode, bool ptp_enabled)
     if (mode == "auto")
         return ptp_enabled ? TimestampSource::Device : TimestampSource::HostReceive;
     for (auto source : {TimestampSource::HostReceive, TimestampSource::Device,
-                        TimestampSource::DeviceOffset})
+                        TimestampSource::DeviceOffset, TimestampSource::Ptp})
         if (mode == timestampSourceName(source))
             return source;
     throw std::invalid_argument(
-      "timestamp_mode must be auto, host_receive, device or device_offset");
+      "timestamp_mode must be auto, host_receive, device, device_offset or ptp");
 }
 
 std::optional<int64_t> timestampOffsetNs(double seconds)
@@ -70,10 +72,57 @@ std::optional<int64_t> timestampOffsetNs(double seconds)
     return static_cast<int64_t>(ns);
 }
 
-std::optional<int64_t> FrameTimestamp::stamp(TimestampSource source, uint64_t device,
-                                             uint64_t receive, int64_t offset)
+namespace
 {
-    uint64_t base = source == TimestampSource::Device ? device : receive;
+constexpr auto max_poll_gap = std::chrono::seconds(2);
+}
+
+PtpLock::PtpLock(std::chrono::seconds window, int64_t max_offset_ns) :
+  window_(window), max_offset_ns_(max_offset_ns)
+{
+    if (window.count() < 0 || max_offset_ns < 0)
+        throw std::invalid_argument("PTP lock window and offset tolerance must be nonnegative");
+}
+
+void PtpLock::observe(PtpSample sample, Clock::time_point poll_time, uint64_t host_ns)
+{
+    sample_ = std::move(sample);
+    const bool good = sample_.status == "Slave" && sample_.offset_ns &&
+      *sample_.offset_ns >= -max_offset_ns_ && *sample_.offset_ns <= max_offset_ns_ &&
+      (!sample_.servo_status || *sample_.servo_status == "Locked");
+    if (!good || poll_time - last_poll_ > max_poll_gap)
+    {
+        good_since_.reset();
+        eligible_from_ns_.reset();
+    }
+    last_poll_ = poll_time;
+    if (!good)
+        return;
+    if (!good_since_)
+        good_since_ = poll_time;
+    if (!eligible_from_ns_ &&
+        std::chrono::duration_cast<std::chrono::seconds>(poll_time - *good_since_) >= window_)
+        eligible_from_ns_ = host_ns;
+}
+
+bool PtpLock::locked(Clock::time_point now) const
+{
+    return eligible_from_ns_.has_value() && now - last_poll_ <= max_poll_gap;
+}
+
+bool PtpLock::covers(uint64_t receive_ns, Clock::time_point now) const
+{
+    return locked(now) && receive_ns >= *eligible_from_ns_;
+}
+
+std::optional<int64_t> FrameTimestamp::stamp(TimestampSource source, uint64_t device,
+                                             uint64_t receive, int64_t offset,
+                                             uint64_t max_host_skew_ns)
+{
+    const bool ptp = source == TimestampSource::Ptp;
+    if (ptp && (device == 0 || receive == 0))
+        return std::nullopt;
+    uint64_t base = (source == TimestampSource::Device || ptp) ? device : receive;
     if (source == TimestampSource::DeviceOffset)
     {
         if (device == 0 || receive == 0 || device == last_device_)
@@ -118,6 +167,13 @@ std::optional<int64_t> FrameTimestamp::stamp(TimestampSource source, uint64_t de
     }
     if (base > max_stamp)
         return std::nullopt;
+    if (ptp)
+    {
+        const uint64_t skew = base > receive ? base - receive : receive - base;
+        if (skew > max_host_skew_ns || (last_ptp_stamp_ && base <= *last_ptp_stamp_))
+            return std::nullopt;
+        last_ptp_stamp_ = base;
+    }
     return static_cast<int64_t>(base);
 }
 

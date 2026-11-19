@@ -35,6 +35,7 @@
 // Std
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -570,6 +571,12 @@ class CameraDriver : public CameraAravisNodeBase
     CalibrationOptions calibration_options_;
     std::atomic<bool> calibration_geometry_changed_{false};
 
+    // Created for PTP-enabled GigE cameras before acquisition threads start.
+    std::optional<PtpLock> ptp_lock_;
+    mutable std::mutex ptp_mutex_;
+    std::condition_variable ptp_wakeup_;
+    bool stop_ptp_polling_ = false;  // guarded by ptp_mutex_
+    uint64_t ptp_max_host_skew_ns_ = 1000000000;
     TimestampSource timestamp_source_ = TimestampSource::HostReceive;
 
     /// Atomic flag, indicating if diagnostics are published.
