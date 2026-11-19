@@ -38,11 +38,22 @@
 
 #include "camera_aravis2/camera_driver.h"
 #include "camera_aravis2/frame_io_chunks.h"
+#include "camera_aravis2/pixel_range_chunks.h"
 
 namespace camera_aravis2
 {
 namespace
 {
+std::string chunkSchema(const std::string& first, const std::string& second)
+{
+    return "<RegisterDescription>" + first + second + "</RegisterDescription>";
+}
+
+std::string integerNode(const std::string& name, const std::string& value)
+{
+    return "<Integer Name=\"" + name + "\"><Value>" + value + "</Value></Integer>";
+}
+
 class MemoryCamera : public CameraDriver
 {
   public:
@@ -78,17 +89,9 @@ TEST(FrameMetadata, IntegerChunksPreserveBitsAndClearUnavailableValues)
 {
     // Fixed GenICam values exercise the Aravis integer parser without a network camera.
     // The parser XML varies to model independently missing fields in successive reads.
-    const auto xml = [](const std::string& sequence, const std::string& lines)
-    {
-        return "<RegisterDescription>" + sequence + lines + "</RegisterDescription>";
-    };
-    const auto integer = [](const std::string& name, const std::string& value)
-    {
-        return "<Integer Name=\"" + name + "\"><Value>" + value + "</Value></Integer>";
-    };
-    const auto sequence = integer("ChunkSequencerSetActive", "9007199254740993");
-    const auto lines = integer("ChunkLineStatusAll", "-9223372036854775807");
-    const auto schema = xml(sequence, lines);
+    const auto sequence = integerNode("ChunkSequencerSetActive", "9007199254740993");
+    const auto lines = integerNode("ChunkLineStatusAll", "-9223372036854775807");
+    const auto schema = chunkSchema(sequence, lines);
     std::unique_ptr<ArvGc, decltype(&g_object_unref)> gc(
       arv_gc_new(nullptr, schema.data(), schema.size()), g_object_unref);
     ASSERT_TRUE(gc);
@@ -111,19 +114,20 @@ TEST(FrameMetadata, IntegerChunksPreserveBitsAndClearUnavailableValues)
     EXPECT_TRUE(msg.line_status_valid);
     EXPECT_EQ(msg.line_status, 0x8000000000000001ULL);
 
-    read(xml(integer("ChunkSequencerSetActive", "-1"), integer("ChunkLineStatusAll", "0")));
+    read(chunkSchema(integerNode("ChunkSequencerSetActive", "-1"),
+                     integerNode("ChunkLineStatusAll", "0")));
     EXPECT_FALSE(msg.sequencer_set_valid);
     EXPECT_EQ(msg.sequencer_set, 0u);
     EXPECT_TRUE(msg.line_status_valid);
     EXPECT_EQ(msg.line_status, 0u);
 
-    read(xml(integer("ChunkSequencerSetActive", "0"), ""));
+    read(chunkSchema(integerNode("ChunkSequencerSetActive", "0"), ""));
     EXPECT_TRUE(msg.sequencer_set_valid);
     EXPECT_EQ(msg.sequencer_set, 0u);
     EXPECT_FALSE(msg.line_status_valid);
     EXPECT_EQ(msg.line_status, 0u);
 
-    read(xml("", lines));
+    read(chunkSchema("", lines));
     EXPECT_FALSE(msg.sequencer_set_valid);
     EXPECT_TRUE(msg.line_status_valid);
     EXPECT_EQ(msg.line_status, 0x8000000000000001ULL);
@@ -133,6 +137,49 @@ TEST(FrameMetadata, IntegerChunksPreserveBitsAndClearUnavailableValues)
     EXPECT_EQ(msg.sequencer_set, 0u);
     EXPECT_FALSE(msg.line_status_valid);
     EXPECT_EQ(msg.line_status, 0u);
+}
+
+TEST(FrameMetadata, PixelRangeRequiresTwoOrderedNonnegativeCountsInTheSameFrame)
+{
+    const auto xml = [](const std::string& low, const std::string& high)
+    {
+        return chunkSchema(low.empty() ? "" : integerNode("ChunkPixelDynamicRangeMin", low),
+                           high.empty() ? "" : integerNode("ChunkPixelDynamicRangeMax", high));
+    };
+    const auto schema = xml("0", "255");
+    std::unique_ptr<ArvGc, decltype(&g_object_unref)> gc(
+      arv_gc_new(nullptr, schema.data(), schema.size()), g_object_unref);
+    ASSERT_TRUE(gc);
+    PixelRangeChunks range(gc.get());
+    ASSERT_TRUE(range.supported());
+
+    std::unique_ptr<ArvBuffer, decltype(&g_object_unref)> buffer(
+      arv_buffer_new_allocate(1), g_object_unref);
+    camera_aravis2_msgs::msg::FrameMetadata msg;
+    const auto check = [&](const std::string& low, const std::string& high, bool valid,
+                           uint64_t expected_low, uint64_t expected_high)
+    {
+        SCOPED_TRACE("min=" + low + ", max=" + high);
+        const auto features = xml(low, high);
+        std::unique_ptr<ArvChunkParser, decltype(&g_object_unref)> parser(
+          arv_chunk_parser_new(features.data(), features.size()), g_object_unref);
+        ASSERT_TRUE(parser);
+        range.read(parser.get(), buffer.get(), msg);
+        EXPECT_EQ(msg.pixel_dynamic_range_valid, valid);
+        EXPECT_EQ(msg.pixel_dynamic_range_min, expected_low);
+        EXPECT_EQ(msg.pixel_dynamic_range_max, expected_high);
+    };
+    check("0", "255", true, 0, 255);
+    check("16", "", false, 0, 0);
+    check("", "4095", false, 0, 0);
+    check("8", "8", false, 0, 0);
+    check("8", "2", false, 0, 0);
+    check("-1", "255", false, 0, 0);
+    check("16", "9007199254740993", true, 16, 9007199254740993ULL);
+    range.read(nullptr, buffer.get(), msg);
+    EXPECT_FALSE(msg.pixel_dynamic_range_valid);
+    EXPECT_EQ(msg.pixel_dynamic_range_min, 0u);
+    EXPECT_EQ(msg.pixel_dynamic_range_max, 0u);
 }
 
 TEST(FrameMetadata, MetadataOnlyAcquisitionAndMatchingImageHeaders)
@@ -193,6 +240,9 @@ TEST(FrameMetadata, MetadataOnlyAcquisitionAndMatchingImageHeaders)
           EXPECT_EQ(msg.sequencer_set, 0u);
           EXPECT_FALSE(msg.line_status_valid);
           EXPECT_EQ(msg.line_status, 0u);
+          EXPECT_FALSE(msg.pixel_dynamic_range_valid);
+          EXPECT_EQ(msg.pixel_dynamic_range_min, 0u);
+          EXPECT_EQ(msg.pixel_dynamic_range_max, 0u);
           frames.emplace(stamp, msg.frame_id);
       });
     ASSERT_TRUE(wait([&]() { return driver->acquiring() && frames.size() >= 3; }));

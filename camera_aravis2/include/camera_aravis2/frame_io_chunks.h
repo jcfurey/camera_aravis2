@@ -32,10 +32,9 @@
 #include <arv.h>
 
 #include <cstdint>
-#include <optional>
 
 #include <camera_aravis2_msgs/msg/frame_metadata.hpp>
-#include "camera_aravis2/error.h"
+#include "camera_aravis2/integer_chunk.h"
 
 namespace camera_aravis2
 {
@@ -44,46 +43,29 @@ class FrameIoChunks
 {
   public:
     explicit FrameIoChunks(ArvGc* genicam) :
-      sequence_(integerFeature(genicam, "ChunkSequencerSetActive")),
-      lines_(integerFeature(genicam, "ChunkLineStatusAll"))
+      sequence_(genicam, "ChunkSequencerSetActive"),
+      lines_(genicam, "ChunkLineStatusAll")
     {
     }
 
-    bool supported() const { return sequence_ || lines_; }
+    bool supported() const { return sequence_.supported() || lines_.supported(); }
 
     void read(ArvChunkParser* parser, ArvBuffer* buffer,
               camera_aravis2_msgs::msg::FrameMetadata& msg) const
     {
-        const auto sequence = readInteger(parser, buffer, sequence_);
+        const auto sequence = sequence_.read(parser, buffer);
         msg.sequencer_set_valid = sequence && *sequence >= 0;
         msg.sequencer_set = msg.sequencer_set_valid ? static_cast<uint64_t>(*sequence) : 0;
 
-        const auto lines = readInteger(parser, buffer, lines_);
+        const auto lines = lines_.read(parser, buffer);
         msg.line_status_valid = lines.has_value();
         // Aravis returns gint64 even for an unsigned GenICam register. Preserve every bit.
         msg.line_status = static_cast<uint64_t>(lines.value_or(0));
     }
 
   private:
-    static const char* integerFeature(ArvGc* genicam, const char* name)
-    {
-        return genicam && ARV_IS_GC_INTEGER(arv_gc_get_node(genicam, name)) ? name : nullptr;
-    }
-
-    static std::optional<int64_t> readInteger(ArvChunkParser* parser, ArvBuffer* buffer,
-                                              const char* name)
-    {
-        if (!parser || !name)
-            return std::nullopt;
-        GuardedGError err;
-        const auto value = arv_chunk_parser_get_integer_value(parser, buffer, name, err.ref());
-        if (err)
-            return std::nullopt;
-        return value;
-    }
-
-    const char* sequence_;
-    const char* lines_;
+    IntegerChunk sequence_;
+    IntegerChunk lines_;
 };
 
 }  // namespace camera_aravis2

@@ -30,3 +30,10 @@ bool sequencer_set_valid
 uint64 sequencer_set
 bool line_status_valid
 uint64 line_status
+
+# Inclusive limits from this buffer's ChunkPixelDynamicRangeMin and ChunkPixelDynamicRangeMax.
+# Units are camera pixel counts before ROS conversion. A valid pair satisfies 0 <= min < max.
+# If either endpoint is missing or the pair is invalid, both values are zero.
+bool pixel_dynamic_range_valid
+uint64 pixel_dynamic_range_min
+uint64 pixel_dynamic_range_max

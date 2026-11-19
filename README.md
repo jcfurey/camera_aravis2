@@ -282,6 +282,21 @@ each frame. The camera's sequencer and line configuration are separate settings.
         "#11_ChunkEnable": true
 ```
 
+To include the pixel dynamic range, enable both selectors under the same `END` mapping.
+
+```yaml
+        "#12_ChunkSelector": PixelDynamicRangeMin
+        "#13_ChunkEnable": true
+        "#14_ChunkSelector": PixelDynamicRangeMax
+        "#15_ChunkEnable": true
+```
+
+When `pixel_dynamic_range_valid` is true, `pixel_dynamic_range_min` and
+`pixel_dynamic_range_max` give the inclusive limits the camera reported in that
+frame, in source pixel counts. For example, a `BayerRG12p` range of 0–4095
+corresponds to 0–65520 after the driver left-shifts each sample into a 16-bit ROS
+image. An absent endpoint or invalid pair clears both values and the validity flag.
+
 ### Automatic reconnect
 
 To run a standalone GigE driver that resumes acquisition when its camera returns, use a
