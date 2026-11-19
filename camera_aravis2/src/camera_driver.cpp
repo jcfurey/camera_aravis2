@@ -58,7 +58,6 @@ CameraDriver::CameraDriver(const std::string& name, const rclcpp::NodeOptions& o
   is_spawning_(false),
   p_white_balance_srv_(nullptr),
   p_parameter_callback_handle_(nullptr),
-  is_diagnostics_published_(false),
   p_diagnostic_pub_(nullptr),
   current_num_subscribers_(0)
 {
@@ -78,19 +77,20 @@ bool CameraDriver::isSpawning() const
 //==================================================================================================
 int CameraDriver::spinStandalone()
 {
-    if (rclcpp::ok() && (isSpawning() || isInitialized()))
+    rclcpp::ExecutorOptions options;
+    options.context = get_node_base_interface()->get_context();
+    if (rclcpp::ok(options.context) && (isSpawning() || isInitialized()))
     {
-        rclcpp::executors::SingleThreadedExecutor executor;
+        rclcpp::executors::SingleThreadedExecutor executor(options);
         executor.add_node(get_node_base_interface());
-        // Stream setup is asynchronous and can exhaust its retries.
-        while (rclcpp::ok() && isSpawning())
+        // Control loss and stream setup can complete on Aravis threads without a ROS event.
+        while (rclcpp::ok(options.context) && !cameraUnavailable() &&
+               (isSpawning() || isInitialized()))
             executor.spin_once(std::chrono::milliseconds(100));
-        if (rclcpp::ok() && isInitialized())
-            executor.spin();
     }
-    if (camera_unavailable_)
+    if (cameraUnavailable())
         return EX_TEMPFAIL;
-    return !rclcpp::ok() || isInitialized() ? EXIT_SUCCESS : EXIT_FAILURE;
+    return !rclcpp::ok(options.context) || isInitialized() ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 //==================================================================================================
@@ -114,7 +114,14 @@ void CameraDriver::setupParameters()
     auto period_desc = buffer_desc;
     period_desc.integer_range.front().from_value = 0;
     period_desc.description = "Wall time between stream diagnostic samples in ms. Zero disables.";
-    declare_parameter<int>("stream_diagnostics_period_ms", 1000, period_desc);
+    const auto period = declare_parameter<int>("stream_diagnostics_period_ms", 1000, period_desc);
+    if (period > 0)
+    {
+        stream_diagnostic_pub_ =
+          create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
+        stream_diagnostic_timer_ = create_wall_timer(std::chrono::milliseconds(period),
+          std::bind(&CameraDriver::publishStreamDiagnostics, this));
+    }
 
     auto stream_names_desc = rcl_interfaces::msg::ParameterDescriptor{};
     stream_names_desc.description =
@@ -277,8 +284,8 @@ bool CameraDriver::setupCameraStreamStructs()
     }
 
     //--- set up structs
-    const std::string GUID_STR = CameraAravisNodeBase::constructCameraGuidStr(p_camera_);
-    streams_                   = std::vector<Stream>(num_streams);
+    hardware_id_ = constructCameraGuidStr(p_camera_);
+    streams_ = std::vector<Stream>(num_streams);
     for (uint i = 0; i < streams_.size(); ++i)
     {
         Stream& stream = streams_[i];
@@ -295,9 +302,9 @@ bool CameraDriver::setupCameraStreamStructs()
         if (is_camera_info_url_param_empty)
         {
             if (streams_.size() > 1)
-                stream.camera_info_url = "file://" + GUID_STR + "_" + stream.name + ".yaml";
+                stream.camera_info_url = "file://" + hardware_id_ + "_" + stream.name + ".yaml";
             else
-                stream.camera_info_url = "file://" + GUID_STR + ".yaml";
+                stream.camera_info_url = "file://" + hardware_id_ + ".yaml";
 
             // replace whitespaces in url (coming from GUID) with '_'
             std::replace(stream.camera_info_url.begin(), stream.camera_info_url.end(), ' ', '_');
@@ -1200,7 +1207,7 @@ void CameraDriver::handleMessageSubscriptionChange()
     //--- evaluate whether to start or stop acquisition only if device is available and if the
     //--- node is initialized. Subscribers that connect earlier are considered at the end of the
     //--- initialization.
-    if (!p_device_ || !this->is_initialized_)
+    if (!isInitialized())
         return;
 
 #ifdef WITH_MATCHED_EVENTS
@@ -1471,6 +1478,12 @@ rcl_interfaces::msg::SetParametersResult CameraDriver::handleDynamicParameterCha
         else if (std::find(dynamic_parameters_names_.begin(), dynamic_parameters_names_.end(),
                            param_name) != dynamic_parameters_names_.end())
         {
+            if (cameraUnavailable())
+            {
+                retVal.successful = false;
+                retVal.reason = "Camera unavailable";
+                return retVal;
+            }
             // Queued buffers do not identify sampling factors or axis reversal. Invalidate
             // the startup snapshot before a live geometry write can reach the device.
             if (param_name == "Width" || param_name == "Height" || param_name == "PixelFormat" ||
@@ -1519,15 +1532,6 @@ rcl_interfaces::msg::SetParametersResult CameraDriver::handleDynamicParameterCha
 //==================================================================================================
 void CameraDriver::setupCameraDiagnosticPublisher()
 {
-    const auto period = get_parameter("stream_diagnostics_period_ms").as_int();
-    if (period > 0)
-    {
-        stream_diagnostic_pub_ =
-          create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
-        stream_diagnostic_timer_ = create_wall_timer(std::chrono::milliseconds(period),
-          std::bind(&CameraDriver::publishStreamDiagnostics, this));
-    }
-
     //--- get diagnostic settings
     auto diagnostic_yaml_url_     = get_parameter("diagnostic_yaml_url").as_string();
     auto diagnostic_publish_rate_ = get_parameter("diagnostic_publishing_rate").as_double();
@@ -1559,7 +1563,6 @@ void CameraDriver::setupCameraDiagnosticPublisher()
               this->create_publisher<camera_aravis2_msgs::msg::CameraDiagnostics>(
                 "~/diagnostics", 1);
 
-            is_diagnostics_published_ = true;
             diagnostic_thread_ =
               std::thread(&CameraDriver::publishCameraDiagnosticsLoop, this,
                           diagnostic_publish_rate_);
@@ -1580,7 +1583,15 @@ void CameraDriver::setupCameraDiagnosticPublisher()
 }
 
 //==================================================================================================
-void CameraDriver::publishCameraDiagnosticsLoop(double rate) const
+bool CameraDriver::waitForWorkerStop(std::chrono::nanoseconds period)
+{
+    std::unique_lock<std::mutex> lock(worker_mutex_);
+    return worker_wakeup_.wait_for(lock, period,
+      [this]() { return stop_workers_ || cameraUnavailable(); });
+}
+
+//==================================================================================================
+void CameraDriver::publishCameraDiagnosticsLoop(double rate)
 {
     camera_aravis2_msgs::msg::CameraDiagnostics cam_diagnostic_msg;
     cam_diagnostic_msg.header.frame_id = this->get_name();
@@ -1594,19 +1605,22 @@ void CameraDriver::publishCameraDiagnosticsLoop(double rate) const
         if (type == "float")
         {
             float float_val;
-            getFeatureValue<float>(name, float_val);
+            if (!getFeatureValue<float>(name, float_val))
+                return value_str;
             value_str = std::to_string(float_val);
         }
         else if (type == "int")
         {
             int int_val;
-            getFeatureValue<int>(name, int_val);
+            if (!getFeatureValue<int>(name, int_val))
+                return value_str;
             value_str = std::to_string(int_val);
         }
         else if (type == "bool")
         {
             bool bool_val;
-            getFeatureValue<bool>(name, bool_val);
+            if (!getFeatureValue<bool>(name, bool_val))
+                return value_str;
             value_str = (bool_val) ? "true" : "false";
         }
         else
@@ -1637,6 +1651,8 @@ void CameraDriver::publishCameraDiagnosticsLoop(double rate) const
     // function to check if feature is available
     auto isFeatureAvailableFn = [&](const std::string& name) -> bool
     {
+        if (cameraUnavailable())
+            return false;
         bool is_successful = true;
         GuardedGError err;
         bool is_feature_available =
@@ -1646,7 +1662,8 @@ void CameraDriver::publishCameraDiagnosticsLoop(double rate) const
         return (is_feature_available && is_successful);
     };
 
-    while (rclcpp::ok() && is_diagnostics_published_)
+    const auto context = get_node_base_interface()->get_context();
+    while (rclcpp::ok(context) && !cameraUnavailable())
     {
         cam_diagnostic_msg.header.stamp = this->now();
 
@@ -1758,9 +1775,11 @@ void CameraDriver::publishCameraDiagnosticsLoop(double rate) const
             feature_idx++;
         }
 
-        p_diagnostic_pub_->publish(cam_diagnostic_msg);
-
-        rclcpp::sleep_for(std::chrono::nanoseconds(static_cast<int64_t>(std::pow(10, 9) / rate)));
+        if (!cameraUnavailable())
+            p_diagnostic_pub_->publish(cam_diagnostic_msg);
+        if (waitForWorkerStop(std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::duration<double>(1.0 / rate))))
+            break;
     }
 }
 
@@ -1785,7 +1804,7 @@ void CameraDriver::spawnCameraStreams()
 
         const int MAX_RETRIES = 60;
         int tryCount          = 1;
-        while (is_spawning_ && !camera_unavailable_ && tryCount <= MAX_RETRIES)
+        while (is_spawning_ && !cameraUnavailable() && tryCount <= MAX_RETRIES)
         {
             //--- select stream channel only if camera is a GigEVision device
             if (arv_camera_is_gv_device(p_camera_))
@@ -1860,7 +1879,6 @@ void CameraDriver::spawnCameraStreams()
     }
 
     //--- print final output message
-    hardware_id_ = constructCameraGuidStr(p_camera_);
     RCLCPP_INFO(logger_, "Done initializing.");
     RCLCPP_INFO(logger_, "  Camera:        %s", hardware_id_.c_str());
     if (arv_camera_is_gv_device(p_camera_) && CameraAravisNodeBase::isIpAddress(guid_))
@@ -1905,7 +1923,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         sensor_msgs::msg::Image::SharedPtr p_img_msg = std::get<1>(buffer_img_pair);
         if (!p_arv_buffer)
             break;
-        if (!stream.is_buffer_processed || !p_img_msg)
+        if (!stream.is_buffer_processed || !p_img_msg || cameraUnavailable())
             continue;
 
         //--- check that image roi corresponds to actual image in buffer
@@ -2078,12 +2096,10 @@ void CameraDriver::printCameraConfiguration() const
     rclcpp::ParameterValue tmp_param_value;
     std::vector<std::pair<std::string, rclcpp::ParameterValue>> tmp_param_values;
 
-    std::string camera_guid_str = CameraAravisNodeBase::constructCameraGuidStr(p_camera_);
-
     RCLCPP_INFO(logger_, "======================================");
     RCLCPP_INFO(logger_, "Camera Configuration:");
     RCLCPP_INFO(logger_, "--------------------------------------");
-    RCLCPP_INFO(logger_, "  GUID:                  %s", camera_guid_str.c_str());
+    RCLCPP_INFO(logger_, "  GUID:                  %s", hardware_id_.c_str());
     if (is_verbose_enable_)
     {
         RCLCPP_INFO(logger_, "  Type:                  %s",
@@ -2294,13 +2310,13 @@ void CameraDriver::stopCameraStreams()
     // Guarded error object
     GuardedGError err;
 
-    //--- stop stream setup and any subsequent GigE PTP polling
+    //--- stop stream setup, PTP polling and camera diagnostic sampling
     is_spawning_ = false;
     {
-        std::lock_guard<std::mutex> lock(ptp_mutex_);
-        stop_ptp_polling_ = true;
+        std::lock_guard<std::mutex> lock(worker_mutex_);
+        stop_workers_ = true;
     }
-    ptp_wakeup_.notify_one();
+    worker_wakeup_.notify_all();
     if (spawn_stream_thread_.joinable())
         spawn_stream_thread_.join();
 
@@ -2312,7 +2328,7 @@ void CameraDriver::stopCameraStreams()
     }
 
     //--- stop acquisition while we still control the camera
-    if (p_device_ && !streams_.empty() && !camera_unavailable_)
+    if (p_device_ && !streams_.empty() && !cameraUnavailable())
     {
         arv_device_execute_command(p_device_, "AcquisitionStop", err.ref());
         CHECK_GERROR_MSG(err, logger_, "In executing 'AcquisitionStop'.");
@@ -2324,7 +2340,6 @@ void CameraDriver::stopCameraStreams()
             arv_stream_set_emit_signals(streams_[i].p_arv_stream, FALSE);
 
     //--- join diagnostic thread
-    is_diagnostics_published_ = false;
     if (diagnostic_thread_.joinable())
     {
         diagnostic_thread_.join();
@@ -2367,7 +2382,7 @@ void CameraDriver::onCalculateWhiteBalanceOnceTriggered(
     //--- set return values to default
     res->is_successful = false;
     //--- check for correct state of node
-    if (!p_device_ || !this->is_initialized_)
+    if (!isInitialized())
         return;
     //--- set white balance mode to 'once' and get calculated values if successful
     if (setFeatureValue<std::string>("BalanceWhiteAuto", "Once"))
@@ -2419,6 +2434,11 @@ void CameraDriver::handleNewBufferSignal(ArvStream* p_stream, gpointer p_user_da
     if (!p_arv_buffer)
         return;
 
+    if (p_ca_instance->cameraUnavailable())
+    {
+        arv_stream_push_buffer(p_stream, p_arv_buffer);
+        return;
+    }
     const auto status = arv_buffer_get_status(p_arv_buffer);
     if (status != ARV_BUFFER_STATUS_SUCCESS)
     {

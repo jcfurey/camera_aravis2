@@ -96,7 +96,7 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
 
     if (!arv_gv_device_is_controller(ARV_GV_DEVICE(p_device_)))
     {
-        camera_unavailable_ = true;
+        camera_unavailable_->store(true);
         RCLCPP_ERROR(logger_, "Camera control unavailable for %s.", guid_.c_str());
         return;
     }
@@ -160,14 +160,8 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
 
         // Keep polling on the startup thread so slow camera reads do not block the
         // executor or frame processing. stopCameraStreams wakes and joins this thread.
-        std::unique_lock<std::mutex> lock(ptp_mutex_);
-        while (!ptp_wakeup_.wait_for(lock, std::chrono::seconds(1),
-                                     [this]() { return stop_ptp_polling_; }))
-        {
-            lock.unlock();
+        while (!waitForWorkerStop(std::chrono::seconds(1)))
             checkPtpState();
-            lock.lock();
-        }
     });
 }
 

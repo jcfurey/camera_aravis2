@@ -117,17 +117,31 @@ void CameraDriver::publishStreamDiagnostics()
     diagnostic_msgs::msg::DiagnosticArray msg;
     {
         std::lock_guard<std::mutex> lock(acquisition_mutex_);
-        if (!is_initialized_)
+        const bool unavailable = cameraUnavailable();
+        if (!is_initialized_ && !unavailable)
             return;
 
         msg.header.stamp = now();
         const auto sample = std::chrono::steady_clock::now();
         const std::chrono::duration<double> interval = sample - last_stream_sample_;
         last_stream_sample_ = sample;
+        if (streams_.empty() && unavailable)
+        {
+            auto& status = msg.status.emplace_back();
+            status.level = Status::ERROR;
+            status.message = "Camera unavailable";
+            status.name = get_fully_qualified_name();
+            status.hardware_id = guid_;
+        }
         for (auto& stream : streams_)
         {
             auto& status = msg.status.emplace_back();
-            if (!stream.p_arv_stream)
+            if (unavailable)
+            {
+                status.level = Status::ERROR;
+                status.message = "Camera control lost";
+            }
+            else if (!stream.p_arv_stream)
             {
                 status.level = Status::ERROR;
                 status.message = "Stream unavailable";

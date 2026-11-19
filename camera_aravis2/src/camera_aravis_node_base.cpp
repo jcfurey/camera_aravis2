@@ -39,6 +39,25 @@
 namespace camera_aravis2
 {
 
+namespace
+{
+// Aravis may finish delivering a signal while the component is unloading. Its closure
+// owns everything it touches, independently of the node and its ROS context.
+struct ControlLostHandler
+{
+    std::shared_ptr<std::atomic<bool>> unavailable;
+    rclcpp::Logger logger;
+    std::string guid;
+};
+
+void handleControlLostSignal(ArvDevice*, gpointer data)
+{
+    auto* handler = static_cast<ControlLostHandler*>(data);
+    handler->unavailable->store(true);
+    RCLCPP_ERROR(handler->logger, "Control to aravis device lost. GUID: %s", handler->guid.c_str());
+}
+}  // namespace
+
 //==================================================================================================
 CameraAravisNodeBase::CameraAravisNodeBase(const std::string& name,
                                            const rclcpp::NodeOptions& options) :
@@ -55,18 +74,20 @@ CameraAravisNodeBase::CameraAravisNodeBase(const std::string& name,
 //==================================================================================================
 CameraAravisNodeBase::~CameraAravisNodeBase()
 {
-    //--- unreference camera pointer
+    if (control_lost_handler_)
+        g_signal_handler_disconnect(p_device_, control_lost_handler_);
+    // Release only this node's camera. The Aravis interfaces and GenICam registry are
+    // process-wide and may still be in use by other components.
     if (p_camera_)
         g_object_unref(p_camera_);
 
-    arv_shutdown();
     RCLCPP_INFO(logger_, "Node has shut down.");
 }
 
 //==================================================================================================
 bool CameraAravisNodeBase::isInitialized() const
 {
-    return (is_initialized_);
+    return is_initialized_ && !cameraUnavailable();
 }
 
 //==================================================================================================
@@ -119,7 +140,7 @@ void CameraAravisNodeBase::setupParameters()
     guid_ = get_parameter("guid").as_string();
     if (!isIpAddress(guid_) && listAvailableCameraDevices() == 0)
     {
-        camera_unavailable_ = rclcpp::ok(context);
+        camera_unavailable_->store(rclcpp::ok(context));
         return false;
     }
 
@@ -154,8 +175,8 @@ void CameraAravisNodeBase::setupParameters()
 
     if (!p_camera_)
     {
-        camera_unavailable_ = rclcpp::ok(context);
-        if (camera_unavailable_)
+        camera_unavailable_->store(rclcpp::ok(context));
+        if (cameraUnavailable())
             RCLCPP_FATAL(logger_, "Failed to open the requested camera.");
         return false;
     }
@@ -164,8 +185,11 @@ void CameraAravisNodeBase::setupParameters()
     p_device_ = arv_camera_get_device(p_camera_);
 
     //--- connect control-lost signal
-    g_signal_connect(p_device_, "control-lost",
-                     (GCallback)CameraAravisNodeBase::handleControlLostSignal, this);
+    control_lost_handler_ = g_signal_connect_data(
+      p_device_, "control-lost", G_CALLBACK(handleControlLostSignal),
+      new ControlLostHandler{camera_unavailable_, logger_, guid_},
+      [](gpointer data, GClosure*) { delete static_cast<ControlLostHandler*>(data); },
+      GConnectFlags(0));
 
     return true;
 }
@@ -226,7 +250,7 @@ bool CameraAravisNodeBase::getFeatureValue(const std::string& feature_name, T& v
     GuardedGError err;
 
     //--- assert that p_device is set
-    if (!p_device_)
+    if (!p_device_ || cameraUnavailable())
         return false;
 
     //--- check if feature is available
@@ -288,7 +312,7 @@ bool CameraAravisNodeBase::setFeatureValue(const std::string& feature_name, cons
     GuardedGError err;
 
     //--- assert that p_device is set
-    if (!p_device_)
+    if (!p_device_ || cameraUnavailable())
         return false;
 
     RCLCPP_DEBUG_STREAM(logger_, "Setting '" << feature_name << "' to '" << value << "'");
@@ -381,7 +405,7 @@ bool CameraAravisNodeBase::setBoundedFeatureValue(const std::string& feature_nam
         max = &tmpMax;
 
     //--- assert that p_device is set
-    if (!p_device_)
+    if (!p_device_ || cameraUnavailable())
         return false;
 
     //--- check if feature is available
@@ -662,7 +686,7 @@ bool CameraAravisNodeBase::executeCommand(const std::string& feature_name) const
     GuardedGError err;
 
     //--- assert that p_device is set
-    if (!p_device_)
+    if (!p_device_ || cameraUnavailable())
         return false;
 
     RCLCPP_DEBUG(logger_, "Executing command '%s'.", feature_name.c_str());
@@ -707,26 +731,9 @@ std::string CameraAravisNodeBase::constructCameraGuidStr(ArvCamera* p_cam)
     const char* device_sn   = arv_camera_get_device_serial_number(p_cam, nullptr);
     const char* device_id   = arv_camera_get_device_id(p_cam, nullptr);
 
-    return (std::string(vendor_name) + "-" +
-            std::string(model_name) + "-" +
-            std::string((device_sn) ? device_sn : device_id));
-}
-
-//==================================================================================================
-void CameraAravisNodeBase::handleControlLostSignal(ArvDevice* p_device, gpointer p_user_data)
-{
-    RCL_UNUSED(p_device);
-
-    CameraAravisNodeBase* p_ca_instance = reinterpret_cast<CameraAravisNodeBase*>(p_user_data);
-
-    if (!p_ca_instance)
-        return;
-
-    p_ca_instance->camera_unavailable_ = true;
-    RCLCPP_FATAL(p_ca_instance->logger_, "Control to aravis device lost.");
-    RCLCPP_FATAL(p_ca_instance->logger_, "  GUID: %s", p_ca_instance->guid_.c_str());
-
-    rclcpp::shutdown();
+    const char* serial = device_sn ? device_sn : device_id;
+    return std::string(vendor_name ? vendor_name : "unknown") + "-" +
+           (model_name ? model_name : "unknown") + "-" + (serial ? serial : "unknown");
 }
 
 }  // end namespace camera_aravis2

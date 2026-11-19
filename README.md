@@ -244,6 +244,12 @@ process reapplies the startup parameters and resets its stream counters and cloc
 Place settings that should survive a restart in the parameter file. For a USB3Vision
 driver, pass `transport:=uv` and the Aravis device ID.
 
+In a ROS component container, an active driver that loses control stops publishing
+images and reports `Camera control lost` at ERROR on `/diagnostics` when stream
+diagnostics are enabled. Other components keep running. When the camera returns,
+unload the affected component and load it again with its original parameters.
+Use `ros2 component list` to find the container name and the ID to unload.
+
 ### Example Launch Files
 
 - ```camera_driver_gv```: [camera_aravis2/launch/camera_driver_gv_example.launch.py](./camera_aravis2/launch/camera_driver_gv_example.launch.py)

@@ -459,7 +459,8 @@ class CameraDriver : public CameraAravisNodeBase
      * This runs in a separate thread and loops at the given rate to read the stats from the camera
      * and published them on hte appropriate topic.
      */
-    void publishCameraDiagnosticsLoop(double rate) const;
+    void publishCameraDiagnosticsLoop(double rate);
+    bool waitForWorkerStop(std::chrono::nanoseconds period);
 
     /**
      * @brief Spawn camera streams.
@@ -577,13 +578,13 @@ class CameraDriver : public CameraAravisNodeBase
     // Created for PTP-enabled GigE cameras before acquisition threads start.
     std::optional<PtpLock> ptp_lock_;
     mutable std::mutex ptp_mutex_;
-    std::condition_variable ptp_wakeup_;
-    bool stop_ptp_polling_ = false;  // guarded by ptp_mutex_
     uint64_t ptp_max_host_skew_ns_ = 1000000000;
     TimestampSource timestamp_source_ = TimestampSource::HostReceive;
 
-    /// Atomic flag, indicating if diagnostics are published.
-    std::atomic<bool> is_diagnostics_published_;
+    // Interrupt long telemetry sampling intervals when unloading a component.
+    std::mutex worker_mutex_;
+    std::condition_variable worker_wakeup_;
+    bool stop_workers_ = false;  // guarded by worker_mutex_
 
     /// Thread in which the publishing of the camera diagnostics runs.
     std::thread diagnostic_thread_;

@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cassert>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -309,13 +310,7 @@ class CameraAravisNodeBase : public rclcpp::Node
      */
     static std::string constructCameraGuidStr(ArvCamera* p_cam);
 
-    /**
-     * @brief Handle 'control-lost' signal emitted by aravis.
-     *
-     * @param[in] p_device Pointer to aravis device.
-     * @param[in] p_user_data Pointer to associated user data.
-     */
-    static void handleControlLostSignal(ArvDevice* p_device, gpointer p_user_data);
+    bool cameraUnavailable() const { return camera_unavailable_->load(); }
 
     //--- MEMBER DECLARATION ---//
 
@@ -324,7 +319,8 @@ class CameraAravisNodeBase : public rclcpp::Node
     std::atomic<bool> is_initialized_;
 
     /// Discovery/open failed or Aravis signalled loss of control.
-    std::atomic<bool> camera_unavailable_{false};
+    const std::shared_ptr<std::atomic<bool>> camera_unavailable_ =
+      std::make_shared<std::atomic<bool>>(false);
 
     /// Logger object of node.
     rclcpp::Logger logger_;
@@ -337,6 +333,9 @@ class CameraAravisNodeBase : public rclcpp::Node
 
     /// GUID of camera.
     std::string guid_;
+
+    /// Aravis signal connection owned by this node.
+    gulong control_lost_handler_ = 0;
 
     /// List of parameter overrides, including parameters that have not been declared.
     std::map<std::string, rclcpp::ParameterValue> parameter_overrides_;

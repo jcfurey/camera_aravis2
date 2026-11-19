@@ -65,7 +65,7 @@ CameraXmlExporter::~CameraXmlExporter()
 //==================================================================================================
 [[nodiscard]] bool CameraXmlExporter::exportXmlDataToFile()
 {
-    if (!is_initialized_)
+    if (!isInitialized())
     {
         RCLCPP_ERROR(logger_, "'%s' is not initialized.", this->get_name());
         return false;
