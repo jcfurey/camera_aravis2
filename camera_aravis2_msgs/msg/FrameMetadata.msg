@@ -11,3 +11,14 @@ uint64 device_timestamp_ns
 uint64 host_receive_timestamp_ns
 # Pixel Format Naming Convention (PFNC) code in the received image, before ROS conversion.
 uint32 pixel_format
+
+# True when Aravis reports chunk data in this buffer.
+bool chunks_present
+# Values come from this frame's ChunkExposureTime and ChunkGain. Missing or unreadable
+# values are NaN with the corresponding valid flag false. Units are from the camera XML.
+bool exposure_valid
+float64 exposure_time
+string exposure_unit
+bool gain_valid
+float64 gain
+string gain_unit

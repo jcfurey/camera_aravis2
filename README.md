@@ -239,6 +239,32 @@ only for frames that pass the same buffer and timestamp checks as the image.
 To inspect a frame from the default GigE node, run
 `ros2 topic echo --once /camera_driver_gv/frame_metadata`.
 
+When the camera sends GenICam chunks, `frame_metadata` reports `chunks_present`.
+The driver reads `ChunkExposureTime` and `ChunkGain` from each individual buffer.
+Check `exposure_valid` and `gain_valid` independently. An unavailable value is
+NaN. The unit strings come from the camera XML and can be empty. Zero gain is
+a valid reading. The published image contains only pixel rows. For packed
+formats, choose an ROI width that produces byte-aligned rows.
+
+The driver reads the camera's existing chunk configuration by default. On a
+LUCID Triton TRI028S-C, the following ROS parameter file enables image,
+exposure and gain chunks during driver startup. Camera models can offer
+different choices for `ChunkSelector`.
+
+```yaml
+/**:
+  ros__parameters:
+    AcquisitionControl:
+      END:
+        "#01_ChunkModeActive": true
+        "#02_ChunkSelector": Image
+        "#03_ChunkEnable": true
+        "#04_ChunkSelector": ExposureTime
+        "#05_ChunkEnable": true
+        "#06_ChunkSelector": Gain
+        "#07_ChunkEnable": true
+```
+
 ### Automatic reconnect
 
 To run a standalone GigE driver that resumes acquisition when its camera returns, use a
@@ -457,7 +483,7 @@ An example of this yaml file is given in [dynamic_parameters_example.yaml](camer
 
 Run `ros2 topic echo /diagnostics` to see one `diagnostic_msgs/msg/DiagnosticStatus` per stream, identified by the fully qualified node name, stream name and camera hardware ID. Listening to diagnostics alone leaves acquisition idle on ROS distributions with publisher matched events.
 
-Aravis reports cumulative `completed_buffers`, `incomplete_buffers` and `buffer_underruns`. GigE streams also report `resent_packets` and `missing_packets`. The driver reports cumulative `published_frames` and `dropped_frames` (complete frames recycled at the buffer limit), the interval `published_fps`, and the current `processing_queue_depth`, `buffers_allocated` and `buffer_limit`. The published count advances when the driver publishes an image and its CameraInfo. Subscriber delivery can differ. The first interval starts once streams and receive buffers are ready. A new incomplete buffer, underrun, missing packet or processing drop raises WARN for that sampling interval. A quiet interval clears the warning. An unopened stream on a partially available camera reports ERROR.
+Aravis reports cumulative `completed_buffers`, `incomplete_buffers` and `buffer_underruns`. GigE streams also report `resent_packets` and `missing_packets`. The driver reports cumulative `published_frames` and `dropped_frames` (complete frames recycled at the buffer limit or discarded for unusable image data), the interval `published_fps`, and the current `processing_queue_depth`, `buffers_allocated` and `buffer_limit`. The published count advances when the driver publishes an image and its CameraInfo. Subscriber delivery can differ. The first interval starts once streams and receive buffers are ready. A new incomplete buffer, underrun, missing packet or processing drop raises WARN for that sampling interval. A quiet interval clears the warning. An unopened stream on a partially available camera reports ERROR.
 
 Camera_aravis allows to periodically monitor custom camera features and publish them in a designated
 topic named ```~/diagnostics``` in a message type as specified in 

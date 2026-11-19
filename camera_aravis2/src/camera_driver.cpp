@@ -52,6 +52,71 @@ static const char* ARV_BUFFER_STATUS_FROM_INT[] =
 namespace camera_aravis2
 {
 
+// Each worker owns a parser. Aravis attaches the current buffer to the parser's GenICam tree.
+class FrameChunks
+{
+  public:
+    explicit FrameChunks(ArvCamera* camera) :
+      exposure_(arv_camera_get_device(camera), "ChunkExposureTime"),
+      gain_(arv_camera_get_device(camera), "ChunkGain")
+    {
+        if (exposure_.supported || gain_.supported)
+            parser_.reset(arv_camera_create_chunk_parser(camera));
+    }
+
+    void read(ArvBuffer* buffer, camera_aravis2_msgs::msg::FrameMetadata& msg) const
+    {
+        msg.chunks_present = arv_buffer_has_chunks(buffer);
+        auto* parser = msg.chunks_present ? parser_.get() : nullptr;
+        msg.exposure_time = exposure_.read(parser, buffer);
+        msg.gain = gain_.read(parser, buffer);
+        msg.exposure_valid = std::isfinite(msg.exposure_time);
+        msg.gain_valid = std::isfinite(msg.gain);
+        msg.exposure_unit = exposure_.unit;
+        msg.gain_unit = gain_.unit;
+    }
+
+  private:
+    struct Field
+    {
+        Field(ArvDevice* device, const char* feature) : name(feature)
+        {
+            auto* node = arv_device_get_feature(device, name);
+            floating = ARV_IS_GC_FLOAT(node);
+            supported = floating || ARV_IS_GC_INTEGER(node);
+            if (supported)
+            {
+                const char* u = floating ? arv_gc_float_get_unit(ARV_GC_FLOAT(node)) :
+                  arv_gc_integer_get_unit(ARV_GC_INTEGER(node));
+                if (u)
+                    unit = u;
+            }
+        }
+
+        double read(ArvChunkParser* parser, ArvBuffer* buffer) const
+        {
+            if (parser && supported)
+            {
+                GuardedGError err;
+                const double value = floating ?
+                  arv_chunk_parser_get_float_value(parser, buffer, name, err.ref()) :
+                  arv_chunk_parser_get_integer_value(parser, buffer, name, err.ref());
+                if (!err && std::isfinite(value))
+                    return value;
+            }
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+
+        const char* name;
+        bool floating;
+        bool supported;
+        std::string unit;
+    };
+
+    Field exposure_, gain_;
+    std::unique_ptr<ArvChunkParser, decltype(&g_object_unref)> parser_{nullptr, g_object_unref};
+};
+
 //==================================================================================================
 CameraDriver::CameraDriver(const std::string& name, const rclcpp::NodeOptions& options) :
   CameraAravisNodeBase(name, options),
@@ -1833,7 +1898,7 @@ void CameraDriver::spawnCameraStreams()
 
                 stream.is_buffer_processed = true;
                 stream.buffer_processing_thread =
-                  std::thread(&CameraDriver::processStreamBuffer, this, i);
+                  std::thread(&CameraDriver::processStreamBuffer, this, i, FrameChunks(p_camera_));
 
                 tuneArvStream(reinterpret_cast<ArvStream*>(stream.p_arv_stream));
 
@@ -1909,7 +1974,7 @@ void CameraDriver::spawnCameraStreams()
 }
 
 //==================================================================================================
-void CameraDriver::processStreamBuffer(const uint stream_id)
+void CameraDriver::processStreamBuffer(const uint stream_id, FrameChunks chunks)
 {
     using namespace std::chrono_literals;
 
@@ -1934,6 +1999,16 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         if (!stream.is_buffer_processed || !p_img_msg || cameraUnavailable())
             continue;
 
+        // Keep the receive buffer alive in buffer_img_pair until its chunks have been read.
+        p_img_msg = stream.p_buffer_pool->imagePixels(p_arv_buffer, p_img_msg);
+        if (!p_img_msg)
+        {
+            ++stream.dropped_frames;
+            RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+                                 "Unusable image data on stream %u.", stream_id);
+            continue;
+        }
+
         //--- check that image roi corresponds to actual image in buffer
         if (adjustImageRoi(stream.image_roi, p_arv_buffer))
         {
@@ -1951,6 +2026,8 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
             ++stream.timestamp_drops;
             continue;
         }
+
+        chunks.read(p_arv_buffer, metadata);
 
         //--- convert to ros format
         if (stream.cvt_pixel_format)
@@ -2030,7 +2107,6 @@ bool CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_im
     p_img_msg->width    = img_roi.width;
     p_img_msg->height   = img_roi.height;
     p_img_msg->encoding = sensor.pixel_format;
-    p_img_msg->step     = (img_roi.width * sensor.n_bits_pixel) / 8;
     return true;
 }
 

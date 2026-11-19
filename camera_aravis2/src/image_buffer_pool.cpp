@@ -29,7 +29,10 @@
 #include "camera_aravis2/image_buffer_pool.h"
 
 // Std
+#include <algorithm>
+#include <cstring>
 #include <functional>
+#include <limits>
 
 namespace camera_aravis2
 {
@@ -70,6 +73,73 @@ sensor_msgs::msg::Image::SharedPtr ImageBufferPool::getRecyclableImg()
         dangling_imgs_.pop();
         return img_ptr;
     }
+}
+
+//==================================================================================================
+sensor_msgs::msg::Image::SharedPtr ImageBufferPool::imagePixels(
+  ArvBuffer* buffer, const sensor_msgs::msg::Image::SharedPtr& received)
+{
+    size_t available = 0;
+    const auto* base = static_cast<const uint8_t*>(arv_buffer_get_data(buffer, &available));
+    const auto* pixels = base;
+    gint x_padding = 0;
+#if ARAVIS_MAJOR_VERSION > 0 || ARAVIS_MINOR_VERSION > 8 || ARAVIS_MICRO_VERSION >= 23
+    if (arv_buffer_get_n_parts(buffer) == 0)
+        return nullptr;
+    const auto type = arv_buffer_get_part_data_type(buffer, 0);
+    if (type < ARV_BUFFER_PART_DATA_TYPE_2D_IMAGE ||
+        type > ARV_BUFFER_PART_DATA_TYPE_CONFIDENCE_MAP)
+        return nullptr;
+    size_t part_size = 0;
+    pixels = static_cast<const uint8_t*>(arv_buffer_get_part_data(buffer, 0, &part_size));
+    if (!base || !pixels || pixels < base || static_cast<size_t>(pixels - base) > available)
+        return nullptr;
+    available = std::min(part_size, available - static_cast<size_t>(pixels - base));
+    arv_buffer_get_image_padding(buffer, &x_padding, nullptr);
+#else
+    const auto type = arv_buffer_get_payload_type(buffer);
+    if (type != ARV_BUFFER_PAYLOAD_TYPE_IMAGE &&
+        type != ARV_BUFFER_PAYLOAD_TYPE_EXTENDED_CHUNK_DATA)
+        return nullptr;
+#endif
+    const gint width = arv_buffer_get_image_width(buffer);
+    const gint height = arv_buffer_get_image_height(buffer);
+    const auto format = arv_buffer_get_image_pixel_format(buffer);
+    const auto bits = ARV_PIXEL_FORMAT_BIT_PER_PIXEL(format);
+    if (!pixels || width <= 0 || height <= 0 || bits == 0 || x_padding < 0)
+        return nullptr;
+    // The converters consume whole packing groups in tightly packed, byte-aligned rows.
+    const uint64_t row_bits = static_cast<uint64_t>(width) * bits;
+    const auto row_bytes = row_bits / 8;
+    if (row_bits % 8 != 0 || row_bytes > std::numeric_limits<uint32_t>::max())
+        return nullptr;
+    // In planar RGB each component has its own scanlines and end-of-line padding.
+    const bool planar = format == ARV_PIXEL_FORMAT_RGB_8_PLANAR ||
+      format == ARV_PIXEL_FORMAT_RGB_10_PLANAR || format == ARV_PIXEL_FORMAT_RGB_12_PLANAR ||
+      format == ARV_PIXEL_FORMAT_RGB_16_PLANAR;
+    const auto planes = planar ? 3u : 1u;
+    const auto line_bytes = row_bytes / planes;
+    const auto lines = static_cast<uint64_t>(height) * planes;
+    const auto stride = line_bytes + x_padding;
+    if (stride > available / lines)
+        return nullptr;
+
+    const size_t size = static_cast<size_t>(row_bytes * height);
+    auto img = received;
+    if (pixels != received->data.data() || size != received->data.size() || x_padding != 0)
+    {
+        // Aravis still owns the receive vector's storage. Resize only an unregistered image.
+        img = getRecyclableImg();
+        img->data.resize(size);
+        if (x_padding == 0)
+            std::memcpy(img->data.data(), pixels, size);
+        else
+            for (size_t row = 0; row < lines; ++row)
+                std::memcpy(img->data.data() + row * line_bytes, pixels + row * stride, line_bytes);
+        img->is_bigendian = received->is_bigendian;
+    }
+    img->step = static_cast<uint32_t>(row_bytes);
+    return img;
 }
 
 //==================================================================================================

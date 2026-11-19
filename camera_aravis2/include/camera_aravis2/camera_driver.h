@@ -73,6 +73,8 @@ extern "C"
 namespace camera_aravis2
 {
 
+class FrameChunks;
+
 /**
  * @brief
  *
@@ -475,7 +477,7 @@ class CameraDriver : public CameraAravisNodeBase
      *
      * @param[in] stream_id ID of stream for which the buffer is to be processed.
      */
-    void processStreamBuffer(const uint stream_id);
+    void processStreamBuffer(const uint stream_id, FrameChunks chunks);
 
     /**
      * @brief Adjust image roi to actual image size stored in the buffer.

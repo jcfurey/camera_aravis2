@@ -68,6 +68,11 @@ class ImageBufferPool : public std::enable_shared_from_this<ImageBufferPool>
     // Get an image whose lifespan is administrated by this pool (but not registered to the camera).
     sensor_msgs::msg::Image::SharedPtr getRecyclableImg();
 
+    // Return tightly packed image rows, excluding chunks, padding and other parts.
+    // Reuse the receive message directly when it already contains exactly these pixels.
+    sensor_msgs::msg::Image::SharedPtr imagePixels(
+      ArvBuffer* buffer, const sensor_msgs::msg::Image::SharedPtr& received);
+
     // Get the image message which wraps around the given ArvBuffer.
     //
     // If this buffer is not administrated by this ImageBufferPool,

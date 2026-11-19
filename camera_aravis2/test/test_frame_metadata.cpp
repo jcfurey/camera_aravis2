@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <set>
@@ -119,6 +120,13 @@ TEST(FrameMetadata, MetadataOnlyAcquisitionAndMatchingImageHeaders)
           EXPECT_EQ(stamp, static_cast<int64_t>(msg.host_receive_timestamp_ns) + 1250000000);
           EXPECT_GT(msg.device_timestamp_ns, 0u);
           EXPECT_GT(msg.frame_id, 0u);
+          EXPECT_FALSE(msg.chunks_present);
+          EXPECT_FALSE(msg.exposure_valid);
+          EXPECT_TRUE(std::isnan(msg.exposure_time));
+          EXPECT_TRUE(msg.exposure_unit.empty());
+          EXPECT_FALSE(msg.gain_valid);
+          EXPECT_TRUE(std::isnan(msg.gain));
+          EXPECT_TRUE(msg.gain_unit.empty());
           frames.emplace(stamp, msg.frame_id);
       });
     ASSERT_TRUE(wait([&]() { return driver->acquiring() && frames.size() >= 3; }));
@@ -127,6 +135,7 @@ TEST(FrameMetadata, MetadataOnlyAcquisitionAndMatchingImageHeaders)
       {
           EXPECT_EQ(msg.header.frame_id, "optical_vis");
           EXPECT_EQ(msg.encoding, "mono8");
+          EXPECT_EQ(msg.data.size(), static_cast<size_t>(msg.step) * msg.height);
           images.insert(rclcpp::Time(msg.header.stamp).nanoseconds());
       });
     auto info = reader->create_subscription<sensor_msgs::msg::CameraInfo>(

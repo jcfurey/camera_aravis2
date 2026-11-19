@@ -28,12 +28,46 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <memory>
 
 #include "camera_aravis2/image_buffer_pool.h"
 
 namespace camera_aravis2
 {
+
+TEST(StreamBuffers, PublishesOnlyPixelsAndPreservesAravisStorage)
+{
+    std::unique_ptr<ArvDevice, decltype(&g_object_unref)> device(
+      arv_fake_device_new("pixel-test", nullptr), g_object_unref);
+    ASSERT_NE(device, nullptr);
+    auto* camera = arv_fake_device_get_fake_camera(ARV_FAKE_DEVICE(device.get()));
+    std::unique_ptr<ArvStream, decltype(&g_object_unref)> stream(
+      arv_device_create_stream(device.get(), nullptr, nullptr, nullptr), g_object_unref);
+    ASSERT_NE(stream, nullptr);
+    const size_t payload = arv_fake_camera_get_payload(camera);
+    ImageBufferPool pool(rclcpp::get_logger("pixel_test"), stream.get(), payload, 0);
+    for (const size_t extra : {0u, 32u})
+    {
+        auto received = std::make_shared<sensor_msgs::msg::Image>();
+        received->data.resize(payload + extra, 0xa5);
+        std::unique_ptr<ArvBuffer, decltype(&g_object_unref)> buffer(
+          arv_buffer_new(received->data.size(), received->data.data()), g_object_unref);
+        arv_fake_camera_fill_buffer(camera, buffer.get(), nullptr);
+        auto pixels = pool.imagePixels(buffer.get(), received);
+        ASSERT_NE(pixels, nullptr);
+        EXPECT_EQ(pixels == received, extra == 0);
+        ASSERT_EQ(pixels->data.size(), payload);
+        EXPECT_EQ(pixels->step, static_cast<uint32_t>(arv_buffer_get_image_width(buffer.get())));
+        EXPECT_TRUE(std::equal(pixels->data.begin(), pixels->data.end(), received->data.begin()));
+        EXPECT_EQ(received->data.size(), payload + extra);
+        EXPECT_EQ(received->data.data(), arv_buffer_get_data(buffer.get(), nullptr));
+        if (extra)
+        {
+            EXPECT_EQ(received->data.back(), 0xa5);
+        }
+    }
+}
 
 TEST(StreamBuffers, RecyclesNewestFrameAtLimitAndResumesWhenConsumerReleasesBuffer)
 {
