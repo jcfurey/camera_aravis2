@@ -28,6 +28,9 @@
 
 #include "camera_aravis2/camera_driver.h"
 
+#include <cmath>
+#include <stdexcept>
+
 // ROS
 #include <image_transport/camera_common.hpp>
 #include <rcl_interfaces/msg/floating_point_range.hpp>
@@ -100,6 +103,29 @@ void CameraDriver::setupParameters()
     camera_info_urls_desc.read_only = true;
     declare_parameter<std::vector<std::string>>("camera_info_urls", std::vector<std::string>({}),
                                                 camera_info_urls_desc);
+
+    auto calibration_desc = rcl_interfaces::msg::ParameterDescriptor{};
+    calibration_desc.read_only = true;
+    calibration_desc.description = "Pixel grid of the calibration files: output or full_sensor.";
+    const auto space =
+      declare_parameter<std::string>("calibration_space", "output", calibration_desc);
+    if (space != "output" && space != "full_sensor")
+        throw std::invalid_argument("calibration_space must be output or full_sensor");
+    calibration_options_.full_sensor = space == "full_sensor";
+    calibration_desc.description = "In full_sensor mode the device reverses axes before cropping.";
+    calibration_options_.reverse_before_roi =
+      declare_parameter<bool>("calibration_reverse_before_roi", false, calibration_desc);
+    calibration_desc.description = "In full_sensor mode ROI offsets use original sensor pixels.";
+    calibration_options_.roi_in_sensor_pixels =
+      declare_parameter<bool>("calibration_roi_in_sensor_pixels", false, calibration_desc);
+    calibration_desc.description = "Origin of the sampled grid in original sensor pixels [x, y].";
+    const auto phase = declare_parameter<std::vector<double>>(
+      "calibration_sampling_offset", {0.0, 0.0}, calibration_desc);
+    if (phase.size() != 2 || !std::isfinite(phase[0]) || !std::isfinite(phase[1]) ||
+        phase[0] < 0 || phase[1] < 0)
+        throw std::invalid_argument(
+          "calibration_sampling_offset requires two finite nonnegative values");
+    calibration_options_.sampling_offset = {phase[0], phase[1]};
 
     auto frame_id_desc = rcl_interfaces::msg::ParameterDescriptor{};
     frame_id_desc.description =
@@ -271,7 +297,7 @@ bool CameraDriver::setupCameraStreamStructs()
         stream.p_camera_info_manager.reset(
           new camera_info_manager::CameraInfoManager(this, stream.sensor.frame_id));
         bool is_successful = stream.p_camera_info_manager->loadCameraInfo(stream.camera_info_url);
-        if (!is_successful)
+        if (!is_successful && !is_camera_info_url_param_empty)
             return false;
     }
 
@@ -467,22 +493,6 @@ void CameraDriver::filterParameterListNames(
             config_warn_msgs_.push_back("Stream " + std::to_string(i) + ": " +
                                         "'" + tmp_feature_name + "' is not as specified.");
 
-        //--- get conversion function and number of bits per pixel corresponding to pixel format
-        const auto itr = CONVERSIONS_DICTIONARY.find(sensor.pixel_format);
-        if (itr != CONVERSIONS_DICTIONARY.end())
-            stream.cvt_pixel_format = itr->second;
-        else
-            config_warn_msgs_.push_back("Stream " + std::to_string(i) + ": " +
-                                        "There is no known conversion from '" +
-                                        sensor.pixel_format +
-                                        "' to a usual ROS image encoding. " +
-                                        "Likely you need to implement one.");
-
-        //--- get bits per pixel
-        sensor.n_bits_pixel =
-          ARV_PIXEL_FORMAT_BIT_PER_PIXEL(arv_camera_get_pixel_format(p_camera_, err.ref()));
-        CHECK_SUCCESS_GERROR_MSG(err, logger_, "In getting 'Bits per Pixel'.", is_successful);
-
         //--- get sensor size
         RCLCPP_DEBUG(logger_, "Evaluating 'ImageFormatControl.SensorWidth' and "
                               "'ImageFormatControl.SensorHeight' for stream %i.",
@@ -649,6 +659,26 @@ void CameraDriver::filterParameterListNames(
             filterParameterListNames(tmp_param_values);
             setFeatureValuesFromParameterList(tmp_param_values, i);
         }
+
+        // Reversal and ROI settings may change the actual Bayer mosaic. Choose the
+        // ROS converter from the final format, after all image-control writes.
+        if (!getFeatureValue<std::string>("PixelFormat", sensor.pixel_format))
+            return false;
+        //--- get conversion function and number of bits per pixel corresponding to pixel format
+        const auto itr = CONVERSIONS_DICTIONARY.find(sensor.pixel_format);
+        if (itr != CONVERSIONS_DICTIONARY.end())
+            stream.cvt_pixel_format = itr->second;
+        else
+            config_warn_msgs_.push_back("Stream " + std::to_string(i) + ": " +
+                                        "There is no known conversion from '" +
+                                        sensor.pixel_format +
+                                        "' to a usual ROS image encoding. " +
+                                        "Likely you need to implement one.");
+
+        //--- get bits per pixel
+        sensor.n_bits_pixel =
+          ARV_PIXEL_FORMAT_BIT_PER_PIXEL(arv_camera_get_pixel_format(p_camera_, err.ref()));
+        CHECK_SUCCESS_GERROR_MSG(err, logger_, "In getting 'Bits per Pixel'.", is_successful);
 
         // NOTE: Not all parameters are essential, which is why only the success of some parameters
         // are checked.
@@ -1392,6 +1422,17 @@ rcl_interfaces::msg::SetParametersResult CameraDriver::handleDynamicParameterCha
         else if (std::find(dynamic_parameters_names_.begin(), dynamic_parameters_names_.end(),
                            param_name) != dynamic_parameters_names_.end())
         {
+            // Queued buffers do not identify sampling factors or axis reversal. Invalidate
+            // the startup snapshot before a live geometry write can reach the device.
+            if (param_name == "Width" || param_name == "Height" || param_name == "PixelFormat" ||
+                param_name == "SensorShutterMode" || param_name == "SensorDigitizationTaps" ||
+                param_name.rfind("Offset", 0) == 0 || param_name.rfind("Center", 0) == 0 ||
+                param_name.rfind("Reverse", 0) == 0 || param_name.rfind("Binning", 0) == 0 ||
+                param_name.rfind("Decimation", 0) == 0 || param_name.rfind("Region", 0) == 0 ||
+                param_name.rfind("MultipleROI", 0) == 0 || param_name == "SourceSelector" ||
+                param_name == "SensorReadoutMode")
+                calibration_geometry_changed_ = true;
+
             switch (param.get_type())
             {
             case rclcpp::PARAMETER_STRING:
@@ -1677,6 +1718,10 @@ void CameraDriver::spawnCameraStreams()
     {
         Stream& stream = streams_[i];
 
+        if (streams_.size() == 1 ||
+            setFeatureValue<std::string>("SourceSelector", "Source" + std::to_string(i)))
+            readCalibrationGeometry(stream);
+
         RCLCPP_INFO(logger_, "Spawning camera stream with ID %i (%s)", i,
                     stream.name.c_str());
 
@@ -1805,7 +1850,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
                         "Image region specified for stream %i (%s) doesn't match received. "
                         "Setting region to: x=%i y=%i width= %i height=%i.",
                         stream_id, stream.name.c_str(),
-                        stream.image_roi.x, stream.image_roi.x,
+                        stream.image_roi.x, stream.image_roi.y,
                         stream.image_roi.width, stream.image_roi.height);
         }
 
@@ -1905,36 +1950,71 @@ void CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_im
 void CameraDriver::fillCameraInfoMsg(Stream& stream,
                                      const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const
 {
-    //--- reset pointer to camera_info message, if not already set
+    auto geometry = stream.calibration_geometry;
+    geometry.known &= !calibration_geometry_changed_;
     if (!stream.p_cam_info_msg)
+        stream.p_cam_info_msg = std::make_shared<sensor_msgs::msg::CameraInfo>();
+    auto& info = *stream.p_cam_info_msg;
+    info = cameraInfoForFrame(stream.p_camera_info_manager->getCameraInfo(),
+                              calibration_options_, geometry, stream.image_roi,
+                              p_img_msg->header);
+    if (info.k[0] == 0.0 && !stream.warned_uncalibrated)
+        RCLCPP_WARN(logger_, "Stream %s is publishing uncalibrated CameraInfo. Check the "
+                    "calibration file, calibration_space, and capture geometry.",
+                    stream.name.c_str());
+    stream.warned_uncalibrated = info.k[0] == 0.0;
+}
+
+//==================================================================================================
+void CameraDriver::readCalibrationGeometry(Stream& stream) const
+{
+    auto& geometry = stream.calibration_geometry;
+    // An absent optional SFNC feature has an identity effect. A failed read is unknown.
+    const auto optionalInt = [this](const char* name, int& value)
     {
-        stream.p_cam_info_msg.reset(new sensor_msgs::msg::CameraInfo());
-
-        //--- fill camera data only once
-        (*stream.p_cam_info_msg) = stream.p_camera_info_manager->getCameraInfo();
-    }
-
-    //--- fill header data each time an image gets published
-    stream.p_cam_info_msg->header = p_img_msg->header;
-
-    //--- check if image size given in camera info corresponds to actual image size.
-    if (stream.p_camera_info_manager->isCalibrated() &&
-        (stream.p_cam_info_msg->width != p_img_msg->width ||
-         stream.p_cam_info_msg->height != p_img_msg->height))
+        return !arv_device_get_feature(p_device_, name) || getFeatureValue<int>(name, value);
+    };
+    const auto optionalBool = [this](const char* name, bool& value)
     {
-        RCLCPP_WARN_ONCE(
-          logger_,
-          "The fields image_width and image_height (%ix%i) in the YAML specified by "
-          "'camera_info_url' parameter seams to be inconsistent with the actual "
-          "image size (%ix%i). Please set them there, because actual image size and specified "
-          "image size can be different due to the region of interest (ROI) feature. In the YAML "
-          "the image size should be the one on which the camera was calibrated. "
-          "See CameraInfo.msg specification!",
-          stream.p_cam_info_msg->width, stream.p_cam_info_msg->height,
-          p_img_msg->width, p_img_msg->height);
-        stream.p_cam_info_msg->width  = p_img_msg->width;
-        stream.p_cam_info_msg->height = p_img_msg->height;
+        return !arv_device_get_feature(p_device_, name) || getFeatureValue<bool>(name, value);
+    };
+
+    auto& roi = geometry.startup_roi;
+    if (!getFeatureValue<int>("Width", roi.width) || !getFeatureValue<int>("Height", roi.height) ||
+        !optionalInt("OffsetX", roi.x) || !optionalInt("OffsetY", roi.y))
+        return;
+
+    if (calibration_options_.full_sensor)
+    {
+        auto readAxis = [&](SensorAxis& axis, const char* size, const char* maximum,
+                            const char* binning, const char* decimation, const char* reverse)
+        {
+            int bin = 1, dec = 1;
+            if (!getFeatureValue<int>(size, axis.pixels) || !optionalInt(binning, bin) ||
+                !optionalInt(decimation, dec) || !optionalBool(reverse, axis.reversed) ||
+                bin < 1 || dec < 1 || axis.pixels / bin < dec)
+                return false;
+            axis.step = bin * dec;
+            // WidthMax/HeightMax measure the whole sampled grid independently of ROI.
+            // A different extent may indicate an additional sampling engine or readout mode.
+            if (!arv_device_get_feature(p_device_, maximum))
+                return !arv_device_get_feature(p_device_, "BinningSelector") &&
+                       !arv_device_get_feature(p_device_, "DecimationSelector");
+            int sampled = 0;
+            return getFeatureValue<int>(maximum, sampled) && sampled == axis.pixels / axis.step;
+        };
+        bool multi_rows = false, multi_cols = false;
+        int imagers = 1;
+        if (!optionalBool("MultipleROIRowsEnable", multi_rows) || multi_rows ||
+            !optionalBool("MultipleROIColumnsEnable", multi_cols) || multi_cols ||
+            !optionalInt("ImagerCount", imagers) || imagers != 1 ||
+            !readAxis(geometry.x, "SensorWidth", "WidthMax", "BinningHorizontal",
+                      "DecimationHorizontal", "ReverseX") ||
+            !readAxis(geometry.y, "SensorHeight", "HeightMax", "BinningVertical",
+                      "DecimationVertical", "ReverseY"))
+            return;
     }
+    geometry.known = true;
 }
 
 //==================================================================================================

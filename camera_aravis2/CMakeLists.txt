@@ -79,6 +79,7 @@ set(LIBRARIES
 )
 
 add_library(${LIBRARY_NAME} SHARED
+  src/calibration_geometry.cpp
   src/camera_aravis_node_base.cpp
   src/camera_driver_gv.cpp
   src/camera_driver_uv.cpp
@@ -145,10 +146,13 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 # Tests
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_calibration_geometry test/test_calibration_geometry.cpp)
+  target_link_libraries(test_calibration_geometry ${LIBRARY_NAME})
   find_package(ament_cmake_copyright REQUIRED)
   ament_copyright()
   find_package(ament_cmake_cppcheck REQUIRED)
-  ament_cppcheck()
+  ament_cppcheck(LANGUAGE c++ LIBRARIES googletest)
   find_package(ament_cmake_cpplint REQUIRED)
   ament_cpplint(FILTERS -whitespace/newline,-readability/braces,-readability/todo)
   find_package(ament_cmake_flake8 REQUIRED)

@@ -69,6 +69,10 @@ The configuration of the camera driver is divided into a driver-specific and Gen
     - Type: String-Array
     - Default: {}
     - Optional. If omitted, it is constructed from the camera GUID located within the current working directory, with the stream name separated by '_' appended to the file name, if more than one streams are instantiated.
+- `calibration_space` selects the pixel grid described by the calibration files for this node.
+    - `output` (default) uses the supplied matrices directly for the configured output ROI. Choose this for a camera calibrated with its current decimation and flips already applied.
+    - `full_sensor` takes an uncropped, unflipped sensor calibration. The driver reads back sampling and reversal, maps K and P into output pixels and preserves D, R and the optical frame. ROI offsets default to sampled pixels, sampling starts at pixel zero, and reversal follows cropping. Set the read-only parameters `calibration_roi_in_sensor_pixels`, `calibration_sampling_offset: [x, y]` (in original sensor pixels), and `calibration_reverse_before_roi` to match the camera's sampling convention. A flipped axis can produce a negative focal length.
+    - An incompatible calibration, an indeterminate sampling geometry, or a runtime change to a sampling/geometry feature produces uncalibrated CameraInfo (`K[0] == 0`) with the image dimensions and header. Restart with the intended settings to establish a new geometry after a live geometry write. Use one static capture geometry per source. Multi-ROI and multi-imager sensor transforms require a device-specific model.
 - `frame_id`: Frame ID that is to be associated with the sensor and, in turn,  with the image data. If multiple streams are supported by the camera, the given ID serves as a base string to which the stream name is appended, together with '_' as separator. 
     - Type: String
     - Default: ""

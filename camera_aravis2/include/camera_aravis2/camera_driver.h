@@ -54,6 +54,7 @@ extern "C"
 #include <rclcpp/service.hpp>
 
 // camera_aravis2
+#include "camera_aravis2/calibration_geometry.h"
 #include "camera_aravis2/camera_aravis_node_base.h"
 #include "camera_aravis2/concurrent_queue.hpp"
 #include "camera_aravis2/config_structs.h"
@@ -131,8 +132,9 @@ class CameraDriver : public CameraAravisNodeBase
         /// Unique pointer to camera info manager.
         std::unique_ptr<camera_info_manager::CameraInfoManager> p_camera_info_manager;
 
-        /// Pointer to camera_info message.
         sensor_msgs::msg::CameraInfo::SharedPtr p_cam_info_msg;
+        CalibrationGeometry calibration_geometry;
+        bool warned_uncalibrated = false;
 
         /// Flag controlling processing of buffer data.
         bool is_buffer_processed;
@@ -476,14 +478,11 @@ class CameraDriver : public CameraAravisNodeBase
                               ArvBuffer* p_buffer, const Sensor& sensor,
                               const ImageRoi& img_roi) const;
 
-    /**
-     * @brief Fill camera_info message.
-     *
-     * @param[in,out] stream Stream object which holds camera_info message and other data.
-     * @param[in] p_img_msg Pointer to corresponding image message.
-     */
-    void fillCameraInfoMsg(CameraDriver::Stream& stream,
+    void fillCameraInfoMsg(Stream& stream,
                            const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const;
+
+    /// Read the final hardware settings before starting acquisition.
+    void readCalibrationGeometry(Stream& stream) const;
 
     /**
      * @brief Pure virtual callback method to inject short processing routines after the
@@ -556,6 +555,9 @@ class CameraDriver : public CameraAravisNodeBase
 
     /// List of the specified dynamic parameter names.
     std::vector<std::string> dynamic_parameters_names_;
+
+    CalibrationOptions calibration_options_;
+    std::atomic<bool> calibration_geometry_changed_{false};
 
     /// Offset in seconds added to the timestamp of the published image messages.
     double timestamp_offset_;
