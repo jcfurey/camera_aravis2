@@ -80,11 +80,12 @@ The configuration of the camera driver is divided into a driver-specific and Gen
 - `timestamp_offset` adds a signed number of seconds to the selected timestamp (default 0.0, writable during streaming). Frames outside the nonnegative ROS message time range are dropped. In `device_offset` mode a zero input timestamp, duplicate device tick, or repeated aligned stamp also drops the frame. Stream diagnostics expose the effective `timestamp_source` and cumulative `timestamp_drops`. A new timestamp drop raises WARN for that interval.
 - `max_stream_buffers` caps the Aravis receive buffers per stream (default 32, minimum 2). Each stream initially allocates up to ten payload-sized buffers and grows on demand. At the limit, if the input queue is empty, the driver recycles the newest complete frame so the receiver has a buffer for the next frame. Frames already queued retain their order.
 - `stream_diagnostics_period_ms` sets the wall-clock sampling period for the standard ROS stream diagnostics (default 1000 milliseconds, zero disables).
+- `stream_stall_timeout_ms` sets how long a requested, continuous free-running stream can go without a completed buffer before diagnostics report ERROR. The default is 5000 ms. Choose an interval longer than the slowest expected frame period or exposure, or set zero to disable the timeout. Diagnostics sample on the `stream_diagnostics_period_ms` timer. An armed trigger can wait indefinitely. Finite acquisitions and cameras with unknown trigger state do not raise a silence error.
 - `stream_socket_buffer_size` requests the GigE stream's host UDP receive buffer in bytes at startup. The default of zero preserves the host's socket default. Linux caps the request at its receive-buffer limit and may report twice the requested size in `ss -um`.
 - `calibration_space` selects the pixel grid described by the calibration files for this node.
     - `output` (default) uses the supplied matrices directly for the configured output ROI. Choose this for a camera calibrated with its current decimation and flips already applied.
     - `full_sensor` takes an uncropped, unflipped sensor calibration. The driver reads back sampling and reversal, maps K and P into output pixels and preserves D, R and the optical frame. ROI offsets default to sampled pixels, sampling starts at pixel zero, and reversal follows cropping. Set the read-only parameters `calibration_roi_in_sensor_pixels`, `calibration_sampling_offset: [x, y]` (in original sensor pixels), and `calibration_reverse_before_roi` to match the camera's sampling convention. A flipped axis can produce a negative focal length.
-    - An incompatible calibration, an indeterminate sampling geometry, or a runtime change to a sampling/geometry feature produces uncalibrated CameraInfo (`K[0] == 0`) with the image dimensions and header. Restart with the intended settings to establish a new geometry after a live geometry write. Use one static capture geometry per source. Multi-ROI and multi-imager sensor transforms require a device-specific model.
+    - An incompatible calibration or indeterminate geometry produces uncalibrated CameraInfo (`K[0] == 0`) with the image dimensions and header. Live ROI changes use the original output calibration only at its startup ROI. Changing sampling or reversal invalidates an output-space calibration until restart. In full-sensor mode the driver reads back the new geometry before resuming capture. Multi-ROI and multi-imager sensor transforms require a device-specific model.
 - `frame_id`: Frame ID that is to be associated with the sensor and, in turn,  with the image data. If multiple streams are supported by the camera, the given ID serves as a base string to which the stream name is appended, together with '_' as separator. 
     - Type: String
     - Default: ""
@@ -485,6 +486,16 @@ Calling this service will trigger a one shot computation of the white balance pa
 This can be called no matter which mode has been set previously.
 
 ### How to dynamically change camera parameters
+
+Use the ROS `set_parameters_atomically` service to apply related features together.
+The driver snapshots each selected camera value before writing it, checks readback,
+and restores earlier writes in reverse order if the camera rejects the batch.
+Put selectors before their dependent features. A failed rollback stops acquisition
+and reports the camera unavailable. Live format, ROI, trigger, and chunk changes
+on a single configured stream pause acquisition, drain old buffers, rebuild the
+receive pool and select the converter for the camera's actual pixel format.
+Subscribers remain connected. Configure these features at startup on multi-stream
+devices, where a feature name alone does not identify a source.
 
 Camera_aravis allows to customize the camera parameters that are to be made dynamically changeable, for example, by utilizing ```rqt_reconfigure```.
 The parameters that are to be changed dynamically can be specified within a yaml file which, in turn, is to be passed to camera_aravis through the [launch parameter](#driver-specific-parameters):

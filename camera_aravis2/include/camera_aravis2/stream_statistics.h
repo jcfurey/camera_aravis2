@@ -38,6 +38,8 @@
 namespace camera_aravis2
 {
 
+enum class FrameExpectation { Unknown, Continuous, Triggered, Finite };
+
 struct StreamCounters
 {
     guint64 completed = 0;
@@ -51,7 +53,8 @@ struct StreamCounters
 
     diagnostic_msgs::msg::DiagnosticStatus describeInterval(
       const StreamCounters& previous, std::chrono::duration<double> interval,
-      bool acquisition_requested, bool is_gige) const;
+      bool acquisition_requested, bool is_gige,
+      FrameExpectation expectation = FrameExpectation::Unknown, bool stalled = false) const;
 };
 
 }  // namespace camera_aravis2

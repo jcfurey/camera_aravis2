@@ -305,13 +305,13 @@ void shift(uint16_t* data, const size_t length, const size_t digits)
 
     uint8_t* from = in->data.data();
     uint8_t* to   = out->data.data();
-    // unpack 4 mono pixels per iteration
+    // unpack two pixels per group
     for (size_t i = 0; i < in->data.size() / 3; ++i)
     {
         to[0] = from[1] << 6;
         to[1] = from[0];
 
-        to[2] = from[1] & 0b11000000;
+        to[2] = (from[1] & 0x30) << 2;
         to[3] = from[2];
 
         to += 4;

@@ -29,6 +29,8 @@
 #ifndef CAMERA_ARAVIS2__CAMERA_DRIVER_H_
 #define CAMERA_ARAVIS2__CAMERA_DRIVER_H_
 
+#include <rclcpp/version.h>
+
 // Yaml-cpp
 #include <yaml-cpp/yaml.h>
 
@@ -131,6 +133,7 @@ class CameraDriver : public CameraAravisNodeBase
 
         /// Conversion function to convert pixel format from sensor into image message.
         ConversionFunction cvt_pixel_format;
+        ArvPixelFormat pixel_format_code{};
 
         /// Image publisher.
         image_transport::Publisher image_pub;
@@ -149,11 +152,14 @@ class CameraDriver : public CameraAravisNodeBase
 
         /// Flag controlling processing of buffer data.
         std::atomic<bool> is_buffer_processed;
+        std::timed_mutex processing_mutex;
         std::atomic<uint64_t> published_frames{0};
         std::atomic<uint64_t> dropped_frames{0};
         FrameTimestamp frame_timestamp;
         std::atomic<uint64_t> timestamp_drops{0};
         StreamCounters previous_counters;
+        FrameExpectation frame_expectation = FrameExpectation::Unknown;
+        std::chrono::steady_clock::time_point last_frame_activity;
 
         /// Thread to process ready stream buffer.
         std::thread buffer_processing_thread;
@@ -436,6 +442,14 @@ class CameraDriver : public CameraAravisNodeBase
      * dynamically changeable and declare them.
      */
     void setupDynamicParameters();
+    bool pauseStream(Stream& stream);
+    bool resumeStream(Stream& stream, bool acquiring);
+    void startBufferWorker(uint stream_id, size_t payload_size);
+    void stopBufferWorker(Stream& stream);
+    FrameExpectation readFrameExpectation() const;
+    bool applyDynamicFeatures(const std::vector<rclcpp::Parameter>& features, std::string& reason);
+    bool readDynamicFeature(const rclcpp::Parameter& spec, rclcpp::Parameter& current) const;
+    bool writeDynamicFeature(const rclcpp::Parameter& value) const;
 
     /**
      * @brief Handle dynamic change of parameters. For example, through rqt_reconfigure.
@@ -578,7 +592,12 @@ class CameraDriver : public CameraAravisNodeBase
     std::vector<std::string> dynamic_parameters_names_;
 
     CalibrationOptions calibration_options_;
-    std::atomic<bool> calibration_geometry_changed_{false};
+    bool output_sampling_changed_ = false;
+#if RCLCPP_VERSION_MAJOR >= 21
+    PostSetParametersCallbackHandle::SharedPtr offset_callback_;
+    std::atomic<int64_t> timestamp_offset_ns_{0};
+#endif
+    std::chrono::milliseconds stall_timeout_{5000};
 
     // Created for PTP-enabled GigE cameras before acquisition threads start.
     std::optional<PtpLock> ptp_lock_;

@@ -54,7 +54,7 @@ void addValue(diagnostic_msgs::msg::DiagnosticStatus& status, const char* key, T
 
 diagnostic_msgs::msg::DiagnosticStatus StreamCounters::describeInterval(
   const StreamCounters& previous, std::chrono::duration<double> interval,
-  bool acquisition_requested, bool is_gige) const
+  bool acquisition_requested, bool is_gige, FrameExpectation expectation, bool stalled) const
 {
     using Status = diagnostic_msgs::msg::DiagnosticStatus;
     Status status;
@@ -86,6 +86,15 @@ diagnostic_msgs::msg::DiagnosticStatus StreamCounters::describeInterval(
     }
     else if (!acquisition_requested)
         status.message = "Idle";
+    else if (!published_delta && expectation == FrameExpectation::Triggered)
+        status.message = "Waiting for trigger";
+    else if (!published_delta && expectation == FrameExpectation::Finite)
+        status.message = "Finite acquisition";
+    else if (!published_delta && expectation == FrameExpectation::Continuous && stalled)
+    {
+        status.level = Status::ERROR;
+        status.message = "Free-running stream stalled";
+    }
     else
         status.message = published_delta ? "Streaming" : "Waiting for frames";
     if (timestamp_drops > previous.timestamp_drops)
@@ -149,9 +158,14 @@ void CameraDriver::publishStreamDiagnostics()
             else
             {
                 const auto counters = readStreamCounters(stream);
+                if (counters.completed != stream.previous_counters.completed)
+                    stream.last_frame_activity = sample;
+                const bool stalled = stall_timeout_.count() > 0 &&
+                  sample - stream.last_frame_activity >= stall_timeout_;
                 status = counters.describeInterval(stream.previous_counters, interval,
                                                    current_num_subscribers_ > 0,
-                                                   ARV_IS_GV_STREAM(stream.p_arv_stream));
+                                                   ARV_IS_GV_STREAM(stream.p_arv_stream),
+                                                   stream.frame_expectation, stalled);
                 addText(status, "timestamp_source", timestampSourceName(timestamp_source_));
                 if (ptp_lock_)
                 {
@@ -164,7 +178,7 @@ void CameraDriver::publishStreamDiagnostics()
                     addText(status, "ptp_offset_ns",
                       ptp.offset_ns ? std::to_string(*ptp.offset_ns) : "unavailable");
                     if (timestamp_source_ == TimestampSource::Ptp && !locked &&
-                        current_num_subscribers_ > 0)
+                        current_num_subscribers_ > 0 && status.level != Status::ERROR)
                     {
                         status.message = status.level == Status::WARN ?
                           status.message + " (waiting for PTP slave lock)" :

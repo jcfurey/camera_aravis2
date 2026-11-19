@@ -102,6 +102,21 @@ TEST(StreamStatistics, WarnsOnlyForNewLossAndDistinguishesTransportFromProcessin
     EXPECT_EQ(report.message, "Processing drops");
 }
 
+TEST(StreamStatistics, DistinguishesSilentContinuousTriggeredFiniteAndIdleAcquisition)
+{
+    StreamCounters counters;
+    const auto report = [&](FrameExpectation mode, bool requested, bool expired)
+    {
+        return counters.describeInterval(counters, 1s, requested, true, mode, expired);
+    };
+    EXPECT_EQ(report(FrameExpectation::Continuous, true, true).level, Status::ERROR);
+    EXPECT_EQ(report(FrameExpectation::Continuous, true, false).level, Status::OK);
+    EXPECT_EQ(report(FrameExpectation::Continuous, false, true).message, "Idle");
+    EXPECT_EQ(report(FrameExpectation::Triggered, true, true).message, "Waiting for trigger");
+    EXPECT_EQ(report(FrameExpectation::Finite, true, true).level, Status::OK);
+    EXPECT_EQ(report(FrameExpectation::Unknown, true, true).level, Status::OK);
+}
+
 TEST(StreamStatistics, ReportsTimestampDropsInTheirOwnInterval)
 {
     StreamCounters previous;

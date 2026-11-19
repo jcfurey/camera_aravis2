@@ -189,6 +189,9 @@ void CameraDriver::setupParameters()
     period_desc.integer_range.front().from_value = 0;
     period_desc.description = "Wall time between stream diagnostic samples in ms. Zero disables.";
     const auto period = declare_parameter<int>("stream_diagnostics_period_ms", 1000, period_desc);
+    period_desc.description = "Free-running silence before a stream error in ms. Zero disables.";
+    stall_timeout_ = std::chrono::milliseconds(
+      declare_parameter<int>("stream_stall_timeout_ms", 5000, period_desc));
     if (period > 0)
     {
         stream_diagnostic_pub_ =
@@ -295,6 +298,18 @@ void CameraDriver::setupParameters()
     const auto offset = declare_parameter<double>("timestamp_offset", 0.0, timestamp_offset_desc);
     if (!timestampOffsetNs(offset))
         throw std::invalid_argument("timestamp_offset must fit in signed 64-bit nanoseconds");
+
+#if RCLCPP_VERSION_MAJOR >= 21
+    // Publish only committed offsets without taking the ROS parameter lock on the frame worker.
+    timestamp_offset_ns_ = *timestampOffsetNs(offset);
+    offset_callback_ = add_post_set_parameters_callback(
+      [this](const std::vector<rclcpp::Parameter>& parameters)
+      {
+          for (const auto& param : parameters)
+              if (param.get_name() == "timestamp_offset")
+                  timestamp_offset_ns_ = *timestampOffsetNs(param.as_double());
+      });
+#endif
 
     //--- register parameter change callback
     p_parameter_callback_handle_ = add_on_set_parameters_callback(
@@ -805,8 +820,8 @@ void CameraDriver::filterParameterListNames(
                                         "Likely you need to implement one.");
 
         //--- get bits per pixel
-        sensor.n_bits_pixel =
-          ARV_PIXEL_FORMAT_BIT_PER_PIXEL(arv_camera_get_pixel_format(p_camera_, err.ref()));
+        stream.pixel_format_code = arv_camera_get_pixel_format(p_camera_, err.ref());
+        sensor.n_bits_pixel = ARV_PIXEL_FORMAT_BIT_PER_PIXEL(stream.pixel_format_code);
         CHECK_SUCCESS_GERROR_MSG(err, logger_, "In getting 'Bits per Pixel'.", is_successful);
 
         // NOTE: Not all parameters are essential, which is why only the success of some parameters
@@ -1305,6 +1320,8 @@ void CameraDriver::handleMessageSubscriptionChange()
     //--- if there are subscribers now and there were none before, start acquisition
     if (new_num_subscribers > 0 && current_num_subscribers_ == 0)
     {
+        for (auto& stream : streams_)
+            stream.last_frame_activity = std::chrono::steady_clock::now();
         RCLCPP_INFO(logger_, "|-> Acquisition start.");
 
         arv_device_execute_command(p_device_, "AcquisitionStart", err.ref());
@@ -1444,34 +1461,22 @@ void CameraDriver::setupDynamicParameters()
 
                             //--- get bounds from device and from yaml file,
                             //--- and choose the intersection of both
-                            rcl_interfaces::msg::IntegerRange intRange;
-                            intRange.from_value = INT_MIN;
-                            intRange.to_value   = INT_MAX;
-                            arv_device_get_integer_feature_bounds(p_device_, feature_name.c_str(),
-                                                                  &intRange.from_value,
-                                                                  &intRange.to_value,
-                                                                  err.ref());
-
-                            if (feature_dict["Min"].IsDefined())
-                                intRange.from_value = std::max(
-                                  static_cast<int>(intRange.from_value),
-                                  feature_dict["Min"].as<int>());
-                            if (feature_dict["Max"].IsDefined())
-                                intRange.to_value = std::min(
-                                  static_cast<int>(intRange.to_value),
-                                  feature_dict["Max"].as<int>());
-
-                            intRange.step = 0;
-
-                            if (intRange.from_value != INT_MIN && intRange.to_value != INT_MAX)
-                                param_desc.integer_range = {intRange};
-
-                            //--- get current value as default
-                            int defVal = 0;
-                            getFeatureValue<int>(feature_name, defVal);
-
-                            //--- declare parameter
-                            declare_parameter<int>(feature_name, defVal, param_desc);
+                            rcl_interfaces::msg::IntegerRange bounds;
+                            bounds.from_value = std::numeric_limits<int64_t>::min();
+                            bounds.to_value = std::numeric_limits<int64_t>::max();
+                            // Geometry and selector changes can alter GenICam bounds at runtime.
+                            // Only the YAML limits are invariant for a ROS parameter descriptor.
+                            if (feature_dict["Min"] || feature_dict["Max"])
+                            {
+                                if (feature_dict["Min"])
+                                    bounds.from_value = feature_dict["Min"].as<int64_t>();
+                                if (feature_dict["Max"])
+                                    bounds.to_value = feature_dict["Max"].as<int64_t>();
+                                param_desc.integer_range = {bounds};
+                            }
+                            int64_t value = 0;
+                            getFeatureValue(feature_name, value);
+                            declare_parameter<int64_t>(feature_name, value, param_desc);
                         }
                         //--- bool type
                         else if (feature_type == "bool")
@@ -1526,87 +1531,41 @@ void CameraDriver::setupDynamicParameters()
 rcl_interfaces::msg::SetParametersResult CameraDriver::handleDynamicParameterChange(
   const std::vector<rclcpp::Parameter>& iParameters)
 {
-    RCLCPP_DEBUG(logger_, "%s", __PRETTY_FUNCTION__);
-
-    // Return value that holds information on success.
-    rcl_interfaces::msg::SetParametersResult retVal;
-    retVal.successful = true;
-
-    //-- loop through all parameters and set information accordingly
-    for (rclcpp::Parameter param : iParameters)
+    rcl_interfaces::msg::SetParametersResult result;
+    std::vector<rclcpp::Parameter> features;
+    std::optional<bool> verbose;
+    for (const auto& param : iParameters)
     {
-        // parameter name (i.e. feature name)
-        std::string param_name = param.get_name();
-
-        //--- verbose
-        if (param_name == "verbose")
-        {
-            is_verbose_enable_ = param.as_bool();
-        }
-        //--- timestamp offset
-        else if (param_name == "timestamp_offset")
+        const auto& name = param.get_name();
+        if (name == "verbose")
+            verbose = param.as_bool();
+        else if (name == "timestamp_offset")
         {
             if (!timestampOffsetNs(param.as_double()))
             {
-                retVal.successful = false;
-                retVal.reason = "timestamp_offset must fit in signed 64-bit nanoseconds";
-                return retVal;
+                result.reason = "timestamp_offset must fit in signed 64-bit nanoseconds";
+                return result;
             }
         }
-        //--- dynamic camera parameters, check if parameter name is in list of specified dynamic
-        //--- parameters
         else if (std::find(dynamic_parameters_names_.begin(), dynamic_parameters_names_.end(),
-                           param_name) != dynamic_parameters_names_.end())
-        {
-            if (cameraUnavailable())
-            {
-                retVal.successful = false;
-                retVal.reason = "Camera unavailable";
-                return retVal;
-            }
-            // Queued buffers do not identify sampling factors or axis reversal. Invalidate
-            // the startup snapshot before a live geometry write can reach the device.
-            if (param_name == "Width" || param_name == "Height" || param_name == "PixelFormat" ||
-                param_name == "SensorShutterMode" || param_name == "SensorDigitizationTaps" ||
-                param_name.rfind("Offset", 0) == 0 || param_name.rfind("Center", 0) == 0 ||
-                param_name.rfind("Reverse", 0) == 0 || param_name.rfind("Binning", 0) == 0 ||
-                param_name.rfind("Decimation", 0) == 0 || param_name.rfind("Region", 0) == 0 ||
-                param_name.rfind("MultipleROI", 0) == 0 || param_name == "SourceSelector" ||
-                param_name == "SensorReadoutMode")
-                calibration_geometry_changed_ = true;
-
-            switch (param.get_type())
-            {
-            case rclcpp::PARAMETER_STRING:
-                retVal.successful &=
-                  setFeatureValue<std::string>(param_name, param.get_value<std::string>());
-                break;
-
-            case rclcpp::PARAMETER_BOOL:
-                retVal.successful &=
-                  setFeatureValue<bool>(param_name, param.get_value<bool>());
-                break;
-
-            case rclcpp::PARAMETER_INTEGER:
-                retVal.successful &=
-                  setFeatureValue<int>(param_name, param.get_value<int>());
-                break;
-
-            case rclcpp::PARAMETER_DOUBLE:
-                retVal.successful &=
-                  setFeatureValue<double>(param_name, param.get_value<double>());
-                break;
-
-            default:
-                RCLCPP_WARN(logger_, "Dynamic parameter is of invalid type '%s'",
-                            param_name.c_str());
-                retVal.successful &= false;
-                break;
-            }
-        }
+                           name) != dynamic_parameters_names_.end())
+            features.push_back(param);
     }
-
-    return retVal;
+    if (!features.empty())
+    {
+        std::lock_guard<std::mutex> guard(acquisition_mutex_);
+        if (!isInitialized())
+        {
+            result.reason = "Camera unavailable or still initializing";
+            return result;
+        }
+        if (!applyDynamicFeatures(features, result.reason))
+            return result;
+    }
+    if (verbose)
+        is_verbose_enable_ = *verbose;
+    result.successful = true;
+    return result;
 }
 
 //==================================================================================================
@@ -1745,6 +1704,8 @@ void CameraDriver::publishCameraDiagnosticsLoop(double rate)
     const auto context = get_node_base_interface()->get_context();
     while (rclcpp::ok(context) && !cameraUnavailable())
     {
+        // Keep diagnostic selector writes out of parameter transactions.
+        std::unique_lock<std::mutex> lock(acquisition_mutex_);
         cam_diagnostic_msg.header.stamp = this->now();
 
         cam_diagnostic_msg.data.clear();
@@ -1857,6 +1818,7 @@ void CameraDriver::publishCameraDiagnosticsLoop(double rate)
 
         if (!cameraUnavailable())
             p_diagnostic_pub_->publish(cam_diagnostic_msg);
+        lock.unlock();
         if (waitForWorkerStop(std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::duration<double>(1.0 / rate))))
             break;
@@ -1875,9 +1837,15 @@ void CameraDriver::spawnCameraStreams()
     {
         Stream& stream = streams_[i];
 
-        if (streams_.size() == 1 ||
-            setFeatureValue<std::string>("SourceSelector", "Source" + std::to_string(i)))
-            readCalibrationGeometry(stream);
+        {
+            std::lock_guard<std::mutex> lock(acquisition_mutex_);
+            if (streams_.size() == 1 ||
+                setFeatureValue<std::string>("SourceSelector", "Source" + std::to_string(i)))
+            {
+                readCalibrationGeometry(stream);
+                stream.frame_expectation = readFrameExpectation();
+            }
+        }
 
         RCLCPP_INFO(logger_, "Spawning camera stream with ID %i (%s)", i,
                     stream.name.c_str());
@@ -1901,13 +1869,7 @@ void CameraDriver::spawnCameraStreams()
                 const auto STREAM_PAYLOAD_SIZE = arv_camera_get_payload(p_camera_, err.ref());
                 CHECK_GERROR_MSG(err, logger_, "In getting payload size of stream.");
 
-                stream.p_buffer_pool.reset(
-                  new ImageBufferPool(logger_, stream.p_arv_stream, STREAM_PAYLOAD_SIZE,
-                                      std::min<size_t>(10, max_stream_buffers_)));
-
-                stream.is_buffer_processed = true;
-                stream.buffer_processing_thread =
-                  std::thread(&CameraDriver::processStreamBuffer, this, i, FrameChunks(p_camera_));
+                startBufferWorker(i, STREAM_PAYLOAD_SIZE);
 
                 tuneArvStream(reinterpret_cast<ArvStream*>(stream.p_arv_stream));
 
@@ -1983,6 +1945,25 @@ void CameraDriver::spawnCameraStreams()
 }
 
 //==================================================================================================
+void CameraDriver::startBufferWorker(uint stream_id, size_t payload_size)
+{
+    auto& stream = streams_[stream_id];
+    stream.p_buffer_pool.reset(new ImageBufferPool(logger_, stream.p_arv_stream, payload_size,
+                                                   std::min<size_t>(10, max_stream_buffers_)));
+    stream.is_buffer_processed = true;
+    stream.buffer_processing_thread =
+      std::thread(&CameraDriver::processStreamBuffer, this, stream_id, FrameChunks(p_camera_));
+}
+
+void CameraDriver::stopBufferWorker(Stream& stream)
+{
+    if (!stream.buffer_processing_thread.joinable())
+        return;
+    stream.is_buffer_processed = false;
+    stream.buffer_queue.push(std::make_pair(nullptr, nullptr));
+    stream.buffer_processing_thread.join();
+}
+
 void CameraDriver::processStreamBuffer(const uint stream_id, FrameChunks chunks)
 {
     using namespace std::chrono_literals;
@@ -2005,6 +1986,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id, FrameChunks chunks)
         sensor_msgs::msg::Image::SharedPtr p_img_msg = std::get<1>(buffer_img_pair);
         if (!p_arv_buffer)
             break;
+        std::lock_guard<std::timed_mutex> processing(stream.processing_mutex);
         if (!stream.is_buffer_processed || !p_img_msg || cameraUnavailable())
             continue;
 
@@ -2015,6 +1997,14 @@ void CameraDriver::processStreamBuffer(const uint stream_id, FrameChunks chunks)
             ++stream.dropped_frames;
             RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
                                  "Unusable image data on stream %u.", stream_id);
+            continue;
+        }
+
+        if (arv_buffer_get_image_pixel_format(p_arv_buffer) != stream.pixel_format_code)
+        {
+            ++stream.dropped_frames;
+            RCLCPP_WARN_THROTTLE(logger_, *get_clock(), 5000,
+                                 "Unexpected pixel format on stream %u.", stream_id);
             continue;
         }
 
@@ -2093,9 +2083,11 @@ bool CameraDriver::adjustImageRoi(ImageRoi& img_roi, ArvBuffer* p_buffer) const
 bool CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
                                        ArvBuffer* p_buffer, Stream& stream) const
 {
-    // Read the committed parameter so an unsuccessful atomic parameter update cannot
-    // change the frame offset. The declaration and set callback validate the conversion.
-    const auto offset = timestampOffsetNs(get_parameter("timestamp_offset").as_double()).value();
+#if RCLCPP_VERSION_MAJOR >= 21
+    const auto offset = timestamp_offset_ns_.load();
+#else
+    const auto offset = *timestampOffsetNs(get_parameter("timestamp_offset").as_double());
+#endif
     const auto receive = arv_buffer_get_system_timestamp(p_buffer);
     if (timestamp_source_ == TimestampSource::Ptp)
     {
@@ -2124,7 +2116,7 @@ void CameraDriver::fillCameraInfoMsg(Stream& stream,
                                      const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const
 {
     auto geometry = stream.calibration_geometry;
-    geometry.known &= !calibration_geometry_changed_;
+    geometry.known &= calibration_options_.full_sensor || !output_sampling_changed_;
     if (!stream.p_cam_info_msg)
         stream.p_cam_info_msg = std::make_shared<sensor_msgs::msg::CameraInfo>();
     auto& info = *stream.p_cam_info_msg;
@@ -2445,20 +2437,8 @@ void CameraDriver::stopCameraStreams()
         diagnostic_thread_.join();
     }
 
-    //--- join buffer threads
-    for (uint i = 0; i < streams_.size(); i++)
-    {
-        Stream& stream = streams_[i];
-
-        if (!stream.buffer_processing_thread.joinable())
-            continue;
-        stream.is_buffer_processed = false;
-
-        //--- push empty object into queue to do final loop
-        stream.buffer_queue.push(std::make_pair(nullptr, nullptr));
-
-        stream.buffer_processing_thread.join();
-    }
+    for (auto& stream : streams_)
+        stopBufferWorker(stream);
 
     //--- print stream statistics
     printStreamStatistics();

@@ -84,6 +84,7 @@ add_library(${LIBRARY_NAME} SHARED
   src/camera_driver_gv.cpp
   src/camera_driver_uv.cpp
   src/camera_driver.cpp
+  src/dynamic_features.cpp
   src/camera_xml_exporter.cpp
   src/conversion_utils.cpp
   src/error.cpp
@@ -154,6 +155,8 @@ if(BUILD_TESTING)
   ament_add_gtest(test_frame_metadata test/test_frame_metadata.cpp)
   target_compile_definitions(test_frame_metadata PRIVATE ${COMMON_COMPILE_DEFINITIONS})
   target_link_libraries(test_frame_metadata ${LIBRARY_NAME})
+  ament_add_gtest(test_packed_pixels test/test_packed_pixels.cpp)
+  target_link_libraries(test_packed_pixels ${LIBRARY_NAME})
   ament_add_gtest(test_control_loss test/test_control_loss.cpp)
   target_link_libraries(test_control_loss ${LIBRARY_NAME})
   ament_add_gtest(test_calibration_geometry test/test_calibration_geometry.cpp)

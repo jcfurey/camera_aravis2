@@ -71,6 +71,19 @@ class MemoryCamera : public CameraDriver
 
     ~MemoryCamera() override { stopCameraStreams(); }
 
+    void exposeLayout()
+    {
+        declare_parameter<int64_t>("Width", width());
+        declare_parameter<std::string>("PixelFormat", "Mono8");
+        dynamic_parameters_names_ = {"Width", "PixelFormat"};
+    }
+
+    int64_t width() const
+    {
+        return arv_device_get_integer_feature_value(p_device_, "Width", nullptr);
+    }
+    size_t bufferSize() const { return streams_[0].p_buffer_pool->getPayloadSize(); }
+
     bool acquiring() const
     {
         auto* camera = arv_fake_device_get_fake_camera(ARV_FAKE_DEVICE(p_device_));
@@ -180,6 +193,34 @@ TEST(FrameMetadata, PixelRangeRequiresTwoOrderedNonnegativeCountsInTheSameFrame)
     EXPECT_FALSE(msg.pixel_dynamic_range_valid);
     EXPECT_EQ(msg.pixel_dynamic_range_min, 0u);
     EXPECT_EQ(msg.pixel_dynamic_range_max, 0u);
+}
+
+TEST(DynamicFeatures, ResizesTheReceivePoolAndRollsBackRejectedBatches)
+{
+    arv_disable_interface("GigEVision");
+    arv_disable_interface("USB3Vision");
+    arv_enable_interface("Fake");
+    rclcpp::init(0, nullptr);
+    rclcpp::NodeOptions options;
+    options.append_parameter_override("guid", "Fake_1");
+    auto driver = std::make_shared<MemoryCamera>(options);
+    ASSERT_TRUE(driver->isInitialized());
+    driver->exposeLayout();
+    const auto initial = driver->width();
+    const auto size = driver->bufferSize();
+    using Param = rclcpp::Parameter;
+    EXPECT_TRUE(driver->set_parameters_atomically({Param("Width", initial / 2)}).successful);
+    EXPECT_EQ(driver->width(), initial / 2);
+    EXPECT_EQ(driver->bufferSize(), size / 2);
+    EXPECT_FALSE(driver->set_parameters_atomically({
+      Param("Width", initial), Param("PixelFormat", "InvalidFormat")}).successful);
+    EXPECT_EQ(driver->width(), initial / 2);
+    EXPECT_EQ(driver->get_parameter("Width").as_int(), initial / 2);
+    EXPECT_EQ(driver->bufferSize(), size / 2);
+    EXPECT_TRUE(driver->set_parameters_atomically({Param("Width", initial)}).successful);
+    EXPECT_EQ(driver->bufferSize(), size);
+    driver.reset();
+    rclcpp::shutdown();
 }
 
 TEST(FrameMetadata, MetadataOnlyAcquisitionAndMatchingImageHeaders)
