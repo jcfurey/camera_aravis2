@@ -33,6 +33,8 @@
 #include <yaml-cpp/yaml.h>
 
 // Std
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -48,6 +50,7 @@ extern "C"
 
 // ROS
 #include <camera_info_manager/camera_info_manager.hpp>
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 #include <image_transport/image_transport.hpp>
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -60,6 +63,7 @@ extern "C"
 #include "camera_aravis2/config_structs.h"
 #include "camera_aravis2/conversion_utils.h"
 #include "camera_aravis2/image_buffer_pool.h"
+#include "camera_aravis2/stream_statistics.h"
 #include <camera_aravis2_msgs/msg/camera_diagnostics.hpp>
 #include <camera_aravis2_msgs/srv/calculate_white_balance.hpp>
 
@@ -137,7 +141,10 @@ class CameraDriver : public CameraAravisNodeBase
         bool warned_uncalibrated = false;
 
         /// Flag controlling processing of buffer data.
-        bool is_buffer_processed;
+        std::atomic<bool> is_buffer_processed;
+        std::atomic<uint64_t> published_frames{0};
+        std::atomic<uint64_t> dropped_frames{0};
+        StreamCounters previous_counters;
 
         /// Thread to process ready stream buffer.
         std::thread buffer_processing_thread;
@@ -435,6 +442,9 @@ class CameraDriver : public CameraAravisNodeBase
      * parsed.
      */
     void setupCameraDiagnosticPublisher();
+    void publishStreamDiagnostics();
+    static StreamCounters readStreamCounters(const Stream& stream);
+    void stopCameraStreams();
 
     /**
      * Read and publish camera diagnostics.
@@ -570,6 +580,12 @@ class CameraDriver : public CameraAravisNodeBase
 
     /// Pointer to publisher for camera diagnostics.
     rclcpp::Publisher<camera_aravis2_msgs::msg::CameraDiagnostics>::SharedPtr p_diagnostic_pub_;
+
+    size_t max_stream_buffers_;
+    std::string hardware_id_;
+    rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr stream_diagnostic_pub_;
+    rclcpp::TimerBase::SharedPtr stream_diagnostic_timer_;
+    std::chrono::steady_clock::time_point last_stream_sample_;
 
     /// Number of subscribers currently connected to the message topic.
     int current_num_subscribers_;

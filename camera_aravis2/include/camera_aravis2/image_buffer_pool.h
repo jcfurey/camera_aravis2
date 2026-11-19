@@ -75,6 +75,10 @@ class ImageBufferPool : public std::enable_shared_from_this<ImageBufferPool>
     // are copied to it.
     sensor_msgs::msg::Image::SharedPtr operator[](ArvBuffer* buffer);
 
+    // Take ownership of a complete buffer. Recycle it immediately if accepting the
+    // frame would exhaust the receive pool at its allocation limit.
+    sensor_msgs::msg::Image::SharedPtr acquireFrame(ArvBuffer* buffer, size_t max_buffers);
+
     inline size_t getAllocatedSize() const
     {
         std::lock_guard<std::mutex> lock(mutex_);

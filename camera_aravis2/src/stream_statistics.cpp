@@ -1,0 +1,156 @@
+// Copyright (c) 2026 camera_aravis2 contributors
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are met:
+//
+//    * Redistributions of source code must retain the above copyright
+//      notice, this list of conditions and the following disclaimer.
+//
+//    * Redistributions in binary form must reproduce the above copyright
+//      notice, this list of conditions and the following disclaimer in the
+//      documentation and/or other materials provided with the distribution.
+//
+//    * Neither the name of the Fraunhofer IOSB nor the names of its
+//      contributors may be used to endorse or promote products derived from
+//      this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+// AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+// IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+// ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+// LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+// SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+// INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+// CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+// ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+// POSSIBILITY OF SUCH DAMAGE.
+
+#include "camera_aravis2/stream_statistics.h"
+
+#include <string>
+
+#include "camera_aravis2/camera_driver.h"
+
+namespace camera_aravis2
+{
+
+namespace
+{
+template <typename T>
+void addValue(diagnostic_msgs::msg::DiagnosticStatus& status, const char* key, T value)
+{
+    auto& entry = status.values.emplace_back();
+    entry.key = key;
+    entry.value = std::to_string(value);
+}
+}  // namespace
+
+diagnostic_msgs::msg::DiagnosticStatus StreamCounters::describeInterval(
+  const StreamCounters& previous, std::chrono::duration<double> interval,
+  bool acquisition_requested, bool is_gige) const
+{
+    using Status = diagnostic_msgs::msg::DiagnosticStatus;
+    Status status;
+    const auto published_delta = published - previous.published;
+    addValue(status, "completed_buffers", completed);
+    addValue(status, "incomplete_buffers", failures);
+    addValue(status, "buffer_underruns", underruns);
+    if (is_gige)
+    {
+        addValue(status, "resent_packets", resent);
+        addValue(status, "missing_packets", missing);
+    }
+    addValue(status, "published_frames", published);
+    const double fps = interval.count() > 0 ? published_delta / interval.count() : 0.0;
+    addValue(status, "published_fps", fps);
+    addValue(status, "dropped_frames", dropped);
+
+    const bool transport_loss = failures > previous.failures ||
+      underruns > previous.underruns || missing > previous.missing;
+    const bool processing_loss = dropped > previous.dropped;
+    if (transport_loss || processing_loss)
+    {
+        status.level = Status::WARN;
+        if (transport_loss && processing_loss)
+            status.message = "Transport loss and processing drops";
+        else
+            status.message = transport_loss ? "Transport loss" : "Processing drops";
+    }
+    else if (!acquisition_requested)
+        status.message = "Idle";
+    else
+        status.message = published_delta ? "Streaming" : "Waiting for frames";
+    return status;
+}
+
+StreamCounters CameraDriver::readStreamCounters(const Stream& stream)
+{
+    StreamCounters counters;
+    arv_stream_get_statistics(stream.p_arv_stream, &counters.completed,
+                              &counters.failures, &counters.underruns);
+    if (ARV_IS_GV_STREAM(stream.p_arv_stream))
+        arv_gv_stream_get_statistics(ARV_GV_STREAM(stream.p_arv_stream),
+                                     &counters.resent, &counters.missing);
+    counters.published = stream.published_frames.load();
+    counters.dropped = stream.dropped_frames.load();
+    return counters;
+}
+
+void CameraDriver::publishStreamDiagnostics()
+{
+    using Status = diagnostic_msgs::msg::DiagnosticStatus;
+    diagnostic_msgs::msg::DiagnosticArray msg;
+    {
+        std::lock_guard<std::mutex> lock(acquisition_mutex_);
+        if (!is_initialized_)
+            return;
+
+        msg.header.stamp = now();
+        const auto sample = std::chrono::steady_clock::now();
+        const std::chrono::duration<double> interval = sample - last_stream_sample_;
+        last_stream_sample_ = sample;
+        for (auto& stream : streams_)
+        {
+            auto& status = msg.status.emplace_back();
+            if (!stream.p_arv_stream)
+            {
+                status.level = Status::ERROR;
+                status.message = "Stream unavailable";
+            }
+            else
+            {
+                const auto counters = readStreamCounters(stream);
+                status = counters.describeInterval(stream.previous_counters, interval,
+                                                   current_num_subscribers_ > 0,
+                                                   ARV_IS_GV_STREAM(stream.p_arv_stream));
+                addValue(status, "processing_queue_depth", stream.buffer_queue.size());
+                addValue(status, "buffers_allocated", stream.p_buffer_pool->getAllocatedSize());
+                addValue(status, "buffer_limit", max_stream_buffers_);
+                stream.previous_counters = counters;
+            }
+            status.name = std::string(get_fully_qualified_name()) + ": " + stream.name;
+            status.hardware_id = hardware_id_;
+        }
+    }
+    stream_diagnostic_pub_->publish(msg);
+}
+
+void CameraDriver::printStreamStatistics() const
+{
+    for (const auto& stream : streams_)
+    {
+        if (!stream.p_arv_stream)
+            continue;
+        const auto counters = readStreamCounters(stream);
+        RCLCPP_INFO_STREAM(logger_, "Statistics for " << stream.name
+          << ": completed=" << counters.completed << " failures=" << counters.failures
+          << " underruns=" << counters.underruns << " published=" << counters.published
+          << " dropped=" << counters.dropped);
+        if (ARV_IS_GV_STREAM(stream.p_arv_stream))
+            RCLCPP_INFO_STREAM(logger_, "Resent packets=" << counters.resent
+              << " missing packets=" << counters.missing);
+    }
+}
+
+}  // namespace camera_aravis2

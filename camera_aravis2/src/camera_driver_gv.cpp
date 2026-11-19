@@ -123,58 +123,7 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
 //==================================================================================================
 CameraDriverGv::~CameraDriverGv()
 {
-    // Guarded error object
-    GuardedGError err;
-
-    //--- stop acquisition
-    if (p_device_)
-    {
-        arv_device_execute_command(p_device_, "AcquisitionStop", err.ref());
-        CHECK_GERROR_MSG(err, logger_, "In executing 'AcquisitionStop'.");
-    }
-
-    //--- stop emitting signals for streams
-    for (uint i = 0; i < streams_.size(); i++)
-        if (streams_[i].p_arv_stream)
-            arv_stream_set_emit_signals(streams_[i].p_arv_stream, FALSE);
-
-    //--- join spawning thread
-    is_spawning_ = false;
-    if (spawn_stream_thread_.joinable())
-        spawn_stream_thread_.join();
-
-    //--- join diagnostic thread
-    is_diagnostics_published_ = false;
-    if (diagnostic_thread_.joinable())
-    {
-        diagnostic_thread_.join();
-    }
-
-    //--- join buffer threads
-    for (uint i = 0; i < streams_.size(); i++)
-    {
-        Stream& stream = streams_[i];
-
-        stream.is_buffer_processed = false;
-
-        //--- push empty object into queue to do final loop
-        stream.buffer_queue.push(std::make_pair(nullptr, nullptr));
-
-        if (stream.buffer_processing_thread.joinable())
-            stream.buffer_processing_thread.join();
-    }
-
-    //--- print stream statistics
-    printStreamStatistics();
-
-    //--- unref pointers
-    for (uint i = 0; i < streams_.size(); i++)
-    {
-        if (streams_[i].p_arv_stream)
-            g_object_unref(streams_[i].p_arv_stream);
-    }
-
-    //--- camera / device object is unreferences in parent class
+    stopCameraStreams();
 }
 
 //==================================================================================================

@@ -105,6 +105,25 @@ sensor_msgs::msg::Image::SharedPtr ImageBufferPool::operator[](ArvBuffer* buffer
 }
 
 //==================================================================================================
+sensor_msgs::msg::Image::SharedPtr ImageBufferPool::acquireFrame(ArvBuffer* buffer,
+                                                                 size_t max_buffers)
+{
+    // Only the stream's receive callback allocates after startup.
+    gint remaining;
+    arv_stream_get_n_buffers(stream_, &remaining, nullptr);
+    if (remaining <= 0)
+    {
+        if (getAllocatedSize() >= max_buffers)
+        {
+            arv_stream_push_buffer(stream_, buffer);
+            return nullptr;
+        }
+        allocateBuffers(1);
+    }
+    return (*this)[buffer];
+}
+
+//==================================================================================================
 void ImageBufferPool::allocateBuffers(size_t n)
 {
     std::lock_guard<std::mutex> lock(mutex_);

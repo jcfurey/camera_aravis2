@@ -30,6 +30,7 @@
 #define CAMERA_ARAVIS2__CAMERA_ARAVIS_NODE_BASE_H_
 
 // Std
+#include <atomic>
 #include <cassert>
 #include <map>
 #include <string>
@@ -320,7 +321,7 @@ class CameraAravisNodeBase : public rclcpp::Node
 
   protected:
     /// Flag indicating if node is initialized.
-    bool is_initialized_;
+    std::atomic<bool> is_initialized_;
 
     /// Logger object of node.
     rclcpp::Logger logger_;

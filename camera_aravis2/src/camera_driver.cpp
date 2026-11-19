@@ -28,7 +28,10 @@
 
 #include "camera_aravis2/camera_driver.h"
 
+#include <algorithm>
 #include <cmath>
+#include <iterator>
+#include <limits>
 #include <stdexcept>
 
 // ROS
@@ -78,6 +81,21 @@ void CameraDriver::setupParameters()
     CameraAravisNodeBase::setupParameters();
 
     //--- stream parameters
+
+    rcl_interfaces::msg::ParameterDescriptor buffer_desc;
+    buffer_desc.read_only = true;
+    buffer_desc.description = "Maximum number of Aravis receive buffers per stream.";
+    rcl_interfaces::msg::IntegerRange range;
+    range.from_value = 2;
+    range.to_value = std::numeric_limits<int>::max();
+    range.step = 1;
+    buffer_desc.integer_range.push_back(range);
+    max_stream_buffers_ = declare_parameter<int>("max_stream_buffers", 32, buffer_desc);
+
+    auto period_desc = buffer_desc;
+    period_desc.integer_range.front().from_value = 0;
+    period_desc.description = "Wall time between stream diagnostic samples in ms. Zero disables.";
+    declare_parameter<int>("stream_diagnostics_period_ms", 1000, period_desc);
 
     auto stream_names_desc = rcl_interfaces::msg::ParameterDescriptor{};
     stream_names_desc.description =
@@ -1470,6 +1488,15 @@ rcl_interfaces::msg::SetParametersResult CameraDriver::handleDynamicParameterCha
 //==================================================================================================
 void CameraDriver::setupCameraDiagnosticPublisher()
 {
+    const auto period = get_parameter("stream_diagnostics_period_ms").as_int();
+    if (period > 0)
+    {
+        stream_diagnostic_pub_ =
+          create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/diagnostics", 10);
+        stream_diagnostic_timer_ = create_wall_timer(std::chrono::milliseconds(period),
+          std::bind(&CameraDriver::publishStreamDiagnostics, this));
+    }
+
     //--- get diagnostic settings
     auto diagnostic_yaml_url_     = get_parameter("diagnostic_yaml_url").as_string();
     auto diagnostic_publish_rate_ = get_parameter("diagnostic_publishing_rate").as_double();
@@ -1744,10 +1771,9 @@ void CameraDriver::spawnCameraStreams()
                 const auto STREAM_PAYLOAD_SIZE = arv_camera_get_payload(p_camera_, err.ref());
                 CHECK_GERROR_MSG(err, logger_, "In getting payload size of stream.");
 
-                // TODO: launch parameter for number of preallocated buffers
                 stream.p_buffer_pool.reset(
-                  new ImageBufferPool(logger_, stream.p_arv_stream,
-                                      static_cast<guint>(STREAM_PAYLOAD_SIZE), 10));
+                  new ImageBufferPool(logger_, stream.p_arv_stream, STREAM_PAYLOAD_SIZE,
+                                      std::min<size_t>(10, max_stream_buffers_)));
 
                 stream.is_buffer_processed = true;
                 stream.buffer_processing_thread =
@@ -1774,11 +1800,10 @@ void CameraDriver::spawnCameraStreams()
             RCLCPP_ERROR(logger_, "%s: Could not create image stream with ID %i (%s).",
                          guid_.c_str(), i, stream.name.c_str());
     }
-    is_spawning_ = false;
-
     //--- if no streams are opened, shut down
     if (num_opened_streams == 0)
     {
+        is_spawning_ = false;
         RCLCPP_FATAL(logger_, "Failed to open streams for camera %s.",
                      guid_.c_str());
         return;
@@ -1804,9 +1829,9 @@ void CameraDriver::spawnCameraStreams()
     }
 
     //--- print final output message
-    std::string camera_guid_str = CameraAravisNodeBase::constructCameraGuidStr(p_camera_);
+    hardware_id_ = constructCameraGuidStr(p_camera_);
     RCLCPP_INFO(logger_, "Done initializing.");
-    RCLCPP_INFO(logger_, "  Camera:        %s", camera_guid_str.c_str());
+    RCLCPP_INFO(logger_, "  Camera:        %s", hardware_id_.c_str());
     if (arv_camera_is_gv_device(p_camera_) && CameraAravisNodeBase::isIpAddress(guid_))
         RCLCPP_INFO(logger_, "  IP:            %s", guid_.c_str());
     RCLCPP_INFO(logger_, "  Num. Streams:  (%i / %i)",
@@ -1814,7 +1839,14 @@ void CameraDriver::spawnCameraStreams()
 
     {
         std::lock_guard<std::mutex> lock(acquisition_mutex_);
+        // Aravis can record underruns while a stream is being set up, before buffers exist.
+        if (stream_diagnostic_timer_)
+            for (auto& stream : streams_)
+                if (stream.p_arv_stream)
+                    stream.previous_counters = readStreamCounters(stream);
+        last_stream_sample_ = std::chrono::steady_clock::now();
         this->is_initialized_ = true;
+        is_spawning_ = false;
     }
 
     //--- When there are already subscribers, start acquisition.
@@ -1831,7 +1863,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
     RCLCPP_INFO(logger_, "Started processing thread for stream %i (%s)", stream_id,
                 stream.name.c_str());
 
-    while (stream.is_buffer_processed)
+    while (true)
     {
         //--- pop buffer pointer from queue, blocking if no item is available
         std::pair<ArvBuffer*, sensor_msgs::msg::Image::SharedPtr> buffer_img_pair;
@@ -1840,7 +1872,9 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         //--- take ownership of pointers
         ArvBuffer* p_arv_buffer                      = std::get<0>(buffer_img_pair);
         sensor_msgs::msg::Image::SharedPtr p_img_msg = std::get<1>(buffer_img_pair);
-        if (!p_arv_buffer || !p_img_msg)
+        if (!p_arv_buffer)
+            break;
+        if (!stream.is_buffer_processed || !p_img_msg)
             continue;
 
         //--- check that image roi corresponds to actual image in buffer
@@ -1872,6 +1906,8 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         //--- publish
         stream.image_pub.publish(*p_img_msg);
         stream.p_camera_info_pub->publish(*stream.p_cam_info_msg);
+
+        ++stream.published_frames;
 
         //--- do post frame processing
         postFrameProcessingCallback(stream_id);
@@ -2234,37 +2270,68 @@ void CameraDriver::printCameraConfiguration() const
 }
 
 //==================================================================================================
-void CameraDriver::printStreamStatistics() const
+void CameraDriver::stopCameraStreams()
 {
+    // Guarded error object
+    GuardedGError err;
+
+    //--- join spawning thread
+    is_spawning_ = false;
+    if (spawn_stream_thread_.joinable())
+        spawn_stream_thread_.join();
+
+    {
+        std::lock_guard<std::mutex> lock(acquisition_mutex_);
+        is_initialized_ = false;
+        if (stream_diagnostic_timer_)
+            stream_diagnostic_timer_->cancel();
+    }
+
+    //--- stop acquisition
+    if (p_device_)
+    {
+        arv_device_execute_command(p_device_, "AcquisitionStop", err.ref());
+        CHECK_GERROR_MSG(err, logger_, "In executing 'AcquisitionStop'.");
+    }
+
+    //--- stop emitting signals for streams
+    for (uint i = 0; i < streams_.size(); i++)
+        if (streams_[i].p_arv_stream)
+            arv_stream_set_emit_signals(streams_[i].p_arv_stream, FALSE);
+
+    //--- join diagnostic thread
+    is_diagnostics_published_ = false;
+    if (diagnostic_thread_.joinable())
+    {
+        diagnostic_thread_.join();
+    }
+
+    //--- join buffer threads
     for (uint i = 0; i < streams_.size(); i++)
     {
-        const Stream& STREAM = streams_[i];
+        Stream& stream = streams_[i];
 
-        if (!STREAM.p_arv_stream)
+        if (!stream.buffer_processing_thread.joinable())
             continue;
+        stream.is_buffer_processed = false;
 
-        guint64 n_completed_buffers = 0;
-        guint64 n_failures          = 0;
-        guint64 n_underruns         = 0;
-        arv_stream_get_statistics(STREAM.p_arv_stream,
-                                  &n_completed_buffers, &n_failures, &n_underruns);
+        //--- push empty object into queue to do final loop
+        stream.buffer_queue.push(std::make_pair(nullptr, nullptr));
 
-        RCLCPP_INFO(logger_, "Statistics for stream %i (%s):", i, STREAM.name.c_str());
-        RCLCPP_INFO(logger_, "  Completed buffers = %li", (uint64_t)n_completed_buffers);
-        RCLCPP_INFO(logger_, "  Failures          = %li", (uint64_t)n_failures);
-        RCLCPP_INFO(logger_, "  Underruns         = %li", (uint64_t)n_underruns);
-
-        if (arv_camera_is_gv_device(p_camera_))
-        {
-            guint64 n_resent;
-            guint64 n_missing;
-
-            arv_gv_stream_get_statistics(reinterpret_cast<ArvGvStream*>(STREAM.p_arv_stream),
-                                         &n_resent, &n_missing);
-            RCLCPP_INFO(logger_, "  Resent buffers    = %li", (uint64_t)n_resent);
-            RCLCPP_INFO(logger_, "  Missing           = %li", (uint64_t)n_missing);
-        }
+        stream.buffer_processing_thread.join();
     }
+
+    //--- print stream statistics
+    printStreamStatistics();
+
+    //--- unref pointers
+    for (uint i = 0; i < streams_.size(); i++)
+    {
+        if (streams_[i].p_arv_stream)
+            g_object_unref(streams_[i].p_arv_stream);
+    }
+
+    //--- camera / device object is unreferences in parent class
 }
 
 //==================================================================================================
@@ -2325,33 +2392,28 @@ void CameraDriver::handleNewBufferSignal(ArvStream* p_stream, gpointer p_user_da
     ///--- get aravis buffer
     ArvBuffer* p_arv_buffer = arv_stream_try_pop_buffer(p_stream);
 
-    //--- check if enough buffers are left, if not allocate one more for the next image
-    gint n_available_buffers;
-    arv_stream_get_n_buffers(p_stream, &n_available_buffers, NULL);
-    if (n_available_buffers == 0)
-        stream.p_buffer_pool->allocateBuffers(1);
-
-    if (p_arv_buffer == nullptr)
+    if (!p_arv_buffer)
         return;
 
-    bool buffer_success = arv_buffer_get_status(p_arv_buffer) == ARV_BUFFER_STATUS_SUCCESS;
-    bool buffer_pool    = static_cast<bool>(stream.p_buffer_pool);
-    if (!buffer_success || !buffer_pool)
+    const auto status = arv_buffer_get_status(p_arv_buffer);
+    if (status != ARV_BUFFER_STATUS_SUCCESS)
     {
-        if (!buffer_success)
-        {
-            RCLCPP_WARN(p_ca_instance->logger_,
-                        "(%s) Frame error: %s",
-                        stream.sensor.frame_id.c_str(),
-                        ARV_BUFFER_STATUS_FROM_INT[arv_buffer_get_status(p_arv_buffer)]);
-        }
-
+        const char* label = status >= 0 && static_cast<size_t>(status) <
+                            std::size(ARV_BUFFER_STATUS_FROM_INT) ?
+                            ARV_BUFFER_STATUS_FROM_INT[status] : "unrecognized status";
+        RCLCPP_WARN(p_ca_instance->logger_, "(%s) Frame error: %s (%d)",
+                    stream.sensor.frame_id.c_str(), label, status);
         arv_stream_push_buffer(p_stream, p_arv_buffer);
         return;
     }
 
-    //--- push buffer pointers into concurrent queue to be processed by processing thread
-    auto p_img_msg = (*stream.p_buffer_pool)[p_arv_buffer];
+    auto p_img_msg = stream.p_buffer_pool->acquireFrame(p_arv_buffer,
+                                                        p_ca_instance->max_stream_buffers_);
+    if (!p_img_msg)
+    {
+        ++stream.dropped_frames;
+        return;
+    }
     stream.buffer_queue.push(std::make_pair(p_arv_buffer, p_img_msg));
 }
 

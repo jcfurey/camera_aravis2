@@ -69,6 +69,8 @@ The configuration of the camera driver is divided into a driver-specific and Gen
     - Type: String-Array
     - Default: {}
     - Optional. If omitted, it is constructed from the camera GUID located within the current working directory, with the stream name separated by '_' appended to the file name, if more than one streams are instantiated.
+- `max_stream_buffers` caps the Aravis receive buffers per stream (default 32, minimum 2). Each stream initially allocates up to ten payload-sized buffers and grows on demand. At the limit, if the input queue is empty, the driver recycles the newest complete frame so the receiver has a buffer for the next frame. Frames already queued retain their order.
+- `stream_diagnostics_period_ms` sets the wall-clock sampling period for the standard ROS stream diagnostics (default 1000 milliseconds, zero disables).
 - `stream_socket_buffer_size` requests the GigE stream's host UDP receive buffer in bytes at startup. The default of zero preserves the host's socket default. Linux caps the request at its receive-buffer limit and may report twice the requested size in `ss -um`.
 - `calibration_space` selects the pixel grid described by the calibration files for this node.
     - `output` (default) uses the supplied matrices directly for the configured output ROI. Choose this for a camera calibrated with its current decimation and flips already applied.
@@ -87,7 +89,7 @@ monitored. See '[How to publish camera diagnostics / status](#how-to-publish-cam
 	- Type: String
 	- Default: ""
     - Optional. If left empty no diagnostic features will be read and published.
-- ```diagnostic_publish_rate```: Rate (in Hz) at which to read and publish the diagnostic data.
+- ```diagnostic_publishing_rate```: Rate (in Hz) at which to read and publish the diagnostic data.
 	- Type: double
 	- Default: 0.1 (every 10 seconds)
 
@@ -401,11 +403,15 @@ An example of this yaml file is given in [dynamic_parameters_example.yaml](camer
 
 ### How to publish camera diagnostics / status
 
+Run `ros2 topic echo /diagnostics` to see one `diagnostic_msgs/msg/DiagnosticStatus` per stream, identified by the fully qualified node name, stream name and camera hardware ID. Listening to diagnostics alone leaves acquisition idle on ROS distributions with publisher matched events.
+
+Aravis reports cumulative `completed_buffers`, `incomplete_buffers` and `buffer_underruns`. GigE streams also report `resent_packets` and `missing_packets`. The driver reports cumulative `published_frames` and `dropped_frames` (complete frames recycled at the buffer limit), the interval `published_fps`, and the current `processing_queue_depth`, `buffers_allocated` and `buffer_limit`. The published count advances when the driver publishes an image and its CameraInfo. Subscriber delivery can differ. The first interval starts once streams and receive buffers are ready. A new incomplete buffer, underrun, missing packet or processing drop raises WARN for that sampling interval. A quiet interval clears the warning. An unopened stream on a partially available camera reports ERROR.
+
 Camera_aravis allows to periodically monitor custom camera features and publish them in a designated
 topic named ```~/diagnostics``` in a message type as specified in 
 [CameraDiagnostics.msg](camera_aravis2_msgs/msg/CameraDiagnostics.msg). In order to configure and customize this 
 status monitoring, two [launch parameters](#driver-specific-parameters) are provided:
-- 'diagnostic_publish_rate', and
+- 'diagnostic_publishing_rate', and
 - 'diagnostic_yaml_url'.
 
 An example of such a diagnostic yaml file is given in 
