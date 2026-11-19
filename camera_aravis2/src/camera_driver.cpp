@@ -28,6 +28,8 @@
 
 #include "camera_aravis2/camera_driver.h"
 
+#include <sysexits.h>
+
 #include <algorithm>
 #include <cmath>
 #include <iterator>
@@ -71,6 +73,24 @@ CameraDriver::~CameraDriver()
 bool CameraDriver::isSpawning() const
 {
     return (is_spawning_);
+}
+
+//==================================================================================================
+int CameraDriver::spinStandalone()
+{
+    if (rclcpp::ok() && (isSpawning() || isInitialized()))
+    {
+        rclcpp::executors::SingleThreadedExecutor executor;
+        executor.add_node(get_node_base_interface());
+        // Stream setup is asynchronous and can exhaust its retries.
+        while (rclcpp::ok() && isSpawning())
+            executor.spin_once(std::chrono::milliseconds(100));
+        if (rclcpp::ok() && isInitialized())
+            executor.spin();
+    }
+    if (camera_unavailable_)
+        return EX_TEMPFAIL;
+    return !rclcpp::ok() || isInitialized() ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
 //==================================================================================================
@@ -1765,7 +1785,7 @@ void CameraDriver::spawnCameraStreams()
 
         const int MAX_RETRIES = 60;
         int tryCount          = 1;
-        while (is_spawning_ && tryCount <= MAX_RETRIES)
+        while (is_spawning_ && !camera_unavailable_ && tryCount <= MAX_RETRIES)
         {
             //--- select stream channel only if camera is a GigEVision device
             if (arv_camera_is_gv_device(p_camera_))
@@ -2291,8 +2311,8 @@ void CameraDriver::stopCameraStreams()
             stream_diagnostic_timer_->cancel();
     }
 
-    //--- stop acquisition
-    if (p_device_)
+    //--- stop acquisition while we still control the camera
+    if (p_device_ && !streams_.empty() && !camera_unavailable_)
     {
         arv_device_execute_command(p_device_, "AcquisitionStop", err.ref());
         CHECK_GERROR_MSG(err, logger_, "In executing 'AcquisitionStop'.");

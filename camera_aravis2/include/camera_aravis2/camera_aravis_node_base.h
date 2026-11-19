@@ -323,6 +323,9 @@ class CameraAravisNodeBase : public rclcpp::Node
     /// Flag indicating if node is initialized.
     std::atomic<bool> is_initialized_;
 
+    /// Discovery/open failed or Aravis signalled loss of control.
+    std::atomic<bool> camera_unavailable_{false};
+
     /// Logger object of node.
     rclcpp::Logger logger_;
 

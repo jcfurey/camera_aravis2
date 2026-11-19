@@ -26,6 +26,7 @@ It currently implements the gigabit ethernet and USB3 protocols used by industri
 
 - [Running the Camera Driver](#running-the-camera-driver)
     - [Configuration](#configuration)
+    - [Automatic reconnect](#automatic-reconnect)
     - [Example Launch Files](#example-launch-files)
 - [Finding Available Cameras](#finding-available-cameras)
 - [Extracting Camera-Specific GenICam XML](#extracting-camera-specific-genicam-xml)
@@ -220,6 +221,28 @@ While the parameters are evaluated by camera_aravis2 in the specific order which
 If a feature is omitted but supported by the camera, it will default to the value that is currently set on the device.
 
 To find the features that are available for configuration on the camera, together with their feature names and their value ranges, look into the documentation of the manufacturer or [extract the camera-specific GenICam XML file](#extracting-camera-specific-genicam-xml).
+
+### Automatic reconnect
+
+To run a standalone GigE driver that resumes acquisition when its camera returns, use a
+device ID from `camera_finder` or a fixed IP address. With an IP address, retries target
+whichever camera owns that address. Use the device ID to follow a specific unit.
+
+```bash
+ros2 launch camera_aravis2 camera_driver_reconnect.launch.py guid:=10.2.2.28
+```
+
+The launcher waits two seconds between driver processes when the camera cannot be opened,
+GigE control is unavailable, or Aravis reports control loss. Each process performs the
+driver's normal device-open attempts. Startup configuration errors and ordinary shutdown
+end retries. Existing subscribers rediscover the publishers on the same topics.
+
+Use `params_file:=/absolute/path/to/camera.yaml`, `namespace:=/front`, and
+`node_name:=camera` to supply the startup configuration. The file must select that node
+or use the ROS wildcard `/**`. The launch argument `guid` takes precedence. Each new
+process reapplies the startup parameters and resets its stream counters and clock state.
+Place settings that should survive a restart in the parameter file. For a USB3Vision
+driver, pass `transport:=uv` and the Aravis device ID.
 
 ### Example Launch Files
 

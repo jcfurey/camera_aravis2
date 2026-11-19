@@ -114,18 +114,18 @@ void CameraAravisNodeBase::setupParameters()
     // Guarded error object
     GuardedGError err;
 
-    //--- Discover available interfaces and devices.
-
-    uint n_devices = listAvailableCameraDevices();
-    if (n_devices == 0)
-        return false;
-
-    //--- connect to camera specified by guid parameter
+    // An addressed GigE camera may be reachable even when discovery broadcasts are filtered.
+    const auto context = get_node_base_interface()->get_context();
     guid_ = get_parameter("guid").as_string();
+    if (!isIpAddress(guid_) && listAvailableCameraDevices() == 0)
+    {
+        camera_unavailable_ = rclcpp::ok(context);
+        return false;
+    }
 
     const int MAX_RETRIES = 10;
     int tryCount          = 1;
-    while (!p_camera_ && tryCount <= MAX_RETRIES)
+    while (rclcpp::ok(context) && !p_camera_ && tryCount <= MAX_RETRIES)
     {
         if (guid_ == "")
         {
@@ -142,16 +142,21 @@ void CameraAravisNodeBase::setupParameters()
         if (!p_camera_)
         {
             CHECK_GERROR(err, logger_);
-            RCLCPP_WARN(logger_, "Unable to open camera. Retrying (%i/%i) ...",
-                        tryCount, MAX_RETRIES);
-            rclcpp::sleep_for(std::chrono::seconds(1));
+            if (tryCount < MAX_RETRIES && rclcpp::ok(context))
+            {
+                RCLCPP_WARN(logger_, "Unable to open camera. Retrying (%i/%i) ...",
+                            tryCount, MAX_RETRIES);
+                rclcpp::sleep_for(std::chrono::seconds(1), context);
+            }
             tryCount++;
         }
     }
 
     if (!p_camera_)
     {
-        RCLCPP_FATAL(logger_, "Failed to open any camera.");
+        camera_unavailable_ = rclcpp::ok(context);
+        if (camera_unavailable_)
+            RCLCPP_FATAL(logger_, "Failed to open the requested camera.");
         return false;
     }
 
@@ -717,6 +722,7 @@ void CameraAravisNodeBase::handleControlLostSignal(ArvDevice* p_device, gpointer
     if (!p_ca_instance)
         return;
 
+    p_ca_instance->camera_unavailable_ = true;
     RCLCPP_FATAL(p_ca_instance->logger_, "Control to aravis device lost.");
     RCLCPP_FATAL(p_ca_instance->logger_, "  GUID: %s", p_ca_instance->guid_.c_str());
 

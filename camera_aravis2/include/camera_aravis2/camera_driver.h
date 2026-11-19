@@ -181,6 +181,9 @@ class CameraDriver : public CameraAravisNodeBase
      */
     bool isSpawning() const;
 
+    /// Run a standalone driver and return its process exit status.
+    int spinStandalone();
+
   protected:
     /**
      * @brief Set up the launch parameters.

@@ -148,6 +148,8 @@ install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 # Tests
 
 if(BUILD_TESTING)
+  find_package(ament_cmake_pytest REQUIRED)
+  ament_add_pytest_test(test_reconnect_launch test/test_reconnect_launch.py TIMEOUT 60)
   find_package(ament_cmake_gtest REQUIRED)
   ament_add_gtest(test_calibration_geometry test/test_calibration_geometry.cpp)
   target_link_libraries(test_calibration_geometry ${LIBRARY_NAME})

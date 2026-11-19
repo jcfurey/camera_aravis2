@@ -94,6 +94,13 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
         return;
     }
 
+    if (!arv_gv_device_is_controller(ARV_GV_DEVICE(p_device_)))
+    {
+        camera_unavailable_ = true;
+        RCLCPP_ERROR(logger_, "Camera control unavailable for %s.", guid_.c_str());
+        return;
+    }
+
     //--- set up structs holding relevant information of camera streams
     CHECK_SUCCESS(setupCameraStreamStructs(), logger_);
 
