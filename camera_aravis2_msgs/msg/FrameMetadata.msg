@@ -37,3 +37,32 @@ uint64 line_status
 bool pixel_dynamic_range_valid
 uint64 pixel_dynamic_range_min
 uint64 pixel_dynamic_range_max
+
+# Configuration sampled before capture. Zero bit depths indicate unknown precision.
+string pixel_format_name
+uint8 pixel_bit_depth
+uint8 storage_bit_depth
+# Number of left-shift bits applied by the driver to unsigned measurement samples.
+uint8 sample_shift
+bool adc_bit_depth_valid
+uint8 adc_bit_depth
+bool black_level_valid
+float64 black_level
+string black_level_unit
+string black_level_selector
+# Inclusive source counts. Source is chunk, camera, pixel_format or unavailable.
+string intensity_range_source
+uint64 intensity_min
+uint64 intensity_max
+# Observed lock covers the reception time of this frame.
+bool ptp_locked
+# Buffer ROI origin and acquisition-time sampling configuration.
+uint32 roi_offset_x
+uint32 roi_offset_y
+bool geometry_valid
+uint32 binning_x
+uint32 binning_y
+uint32 decimation_x
+uint32 decimation_y
+bool reverse_x
+bool reverse_y

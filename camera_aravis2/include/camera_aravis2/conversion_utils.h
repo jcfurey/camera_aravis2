@@ -134,7 +134,7 @@ const std::map<std::string, ConversionFunction> CONVERSIONS_DICTIONARY =
     {"YUV422_8_UYVY", std::bind(&renameImg, std::placeholders::_1, std::placeholders::_2,
                                 sensor_msgs::image_encodings::YUV422)},
     {"YUV422_8", std::bind(&renameImg, std::placeholders::_1, std::placeholders::_2,
-                           sensor_msgs::image_encodings::YUV422)},
+                           sensor_msgs::image_encodings::YUV422_YUY2)},
 
     // non-color contents
     {"Data8", std::bind(&renameImg, std::placeholders::_1, std::placeholders::_2,

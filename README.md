@@ -27,6 +27,7 @@ It currently implements the gigabit ethernet and USB3 protocols used by industri
 - [Running the Camera Driver](#running-the-camera-driver)
     - [Configuration](#configuration)
     - [Per-frame metadata](#per-frame-metadata)
+    - [Feature readback and software trigger](#feature-readback-and-software-trigger)
     - [Automatic reconnect](#automatic-reconnect)
     - [Example Launch Files](#example-launch-files)
 - [Finding Available Cameras](#finding-available-cameras)
@@ -234,6 +235,18 @@ format before conversion to a ROS encoding. Both timestamps preserve the values
 returned by Aravis across ROS timestamp modes and offsets. A frame ID can wrap
 or reset when the camera restarts. [FrameMetadata message definition](camera_aravis2_msgs/msg/FrameMetadata.msg)
 
+The metadata also gives the GenICam format name, significant bits per channel,
+ROS storage depth and the left shift applied during unpacking. For example, a
+`BayerRG10Packed` sample published in `bayer_rggb16` has `sample_shift=6`.
+Shift the stored unsigned value right by six to recover the original count.
+`intensity_min` and `intensity_max` are inclusive source counts. The
+`intensity_range_source` identifies the frame chunk, camera feature, format
+fallback, or an unavailable range. Check the validity flags for ADC depth,
+black level and geometry before use. Geometry includes ROI origin, binning,
+decimation and flips. `ptp_locked` reports whether the driver's observed PTP
+lock covers this frame's reception. Rebuild metadata consumers with the updated
+message definition.
+
 On Kilted and Lyrical, subscribing to metadata alone starts acquisition. Removing
 the last subscriber to all frame topics stops it. The driver publishes metadata
 only for frames that pass the same buffer and timestamp checks as the image.
@@ -298,33 +311,54 @@ frame, in source pixel counts. For example, a `BayerRG12p` range of 0–4095
 corresponds to 0–65520 after the driver left-shifts each sample into a 16-bit ROS
 image. An absent endpoint or invalid pair clears both values and the validity flag.
 
+### Feature readback and software trigger
+
+Query the connected camera's current GenICam selector bank with `~/get_feature`.
+The response includes availability, access, type and value, numeric limits and units,
+or the supported enumeration choices. It also works for features outside the dynamic
+parameter YAML. For example, to inspect a Triton's pixel format, run
+
+```bash
+ros2 service call /camera_driver_gv/get_feature camera_aravis2_msgs/srv/GetFeature "{name: PixelFormat}"
+```
+
+With a frame subscriber connected, select `FrameStart`, `TriggerSource=Software` and
+`TriggerMode=On`. Call the following service once per requested image. Success means
+that the camera accepted the command. Match the resulting image and metadata by header.
+
+```bash
+ros2 service call /camera_driver_gv/trigger_image std_srvs/srv/Trigger '{}'
+```
+
+A slow free-running camera can start streaming after Aravis times out waiting for the
+`AcquisitionStart` acknowledgement. The driver checks for a newly completed buffer
+before reporting success. It waits for the configured stream stall timeout, bounded to
+3–30 seconds after the timeout. This also applies to restarts during live layout changes.
+
 ### Automatic reconnect
 
-To run a standalone GigE driver that resumes acquisition when its camera returns, use a
-device ID from `camera_finder` or a fixed IP address. With an IP address, retries target
-whichever camera owns that address. Use the device ID to follow a specific unit.
+After the first successful connection, standalone and composable drivers reopen the
+same camera after control loss or a sustained stall in a requested free-running
+stream. The recovery check runs every two seconds. Waiting for a trigger or having
+no frame subscribers is a healthy idle state. Use `stream_stall_timeout_ms` to allow
+for your slowest continuous exposure and frame period.
+
+Existing subscriptions stay connected. Recovery reapplies startup configuration and
+accepted dynamic feature values with their selector banks, then resumes acquisition
+when subscribers are present. Stream diagnostics expose the number of reconnects.
+The driver retains these live settings for the lifetime of its process. Set
+`auto_reconnect:=false` to disable in-process recovery.
+
+To retry a standalone driver when the camera is already absent at startup, use
 
 ```bash
 ros2 launch camera_aravis2 camera_driver_reconnect.launch.py guid:=10.2.2.28
 ```
 
-The launcher waits two seconds between driver processes when the camera cannot be opened,
-GigE control is unavailable, or Aravis reports control loss. Each process performs the
-driver's normal device-open attempts. Startup configuration errors and ordinary shutdown
-end retries. Existing subscribers rediscover the publishers on the same topics.
-
 Use `params_file:=/absolute/path/to/camera.yaml`, `namespace:=/front`, and
-`node_name:=camera` to supply the startup configuration. The file must select that node
-or use the ROS wildcard `/**`. The launch argument `guid` takes precedence. Each new
-process reapplies the startup parameters and resets its stream counters and clock state.
-Place settings that should survive a restart in the parameter file. For a USB3Vision
-driver, pass `transport:=uv` and the Aravis device ID.
-
-In a ROS component container, an active driver that loses control stops publishing
-images and reports `Camera control lost` at ERROR on `/diagnostics` when stream
-diagnostics are enabled. Other components keep running. When the camera returns,
-unload the affected component and load it again with its original parameters.
-Use `ros2 component list` to find the container name and the ID to unload.
+`node_name:=camera` to supply the startup configuration. Use `transport:=uv`
+and an Aravis device ID for a USB3 Vision driver. A process restart loads the
+settings from the parameter file.
 
 ### Example Launch Files
 

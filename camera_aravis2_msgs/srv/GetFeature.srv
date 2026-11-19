@@ -1,0 +1,16 @@
+# Exact GenICam node name. Uses the currently selected bank.
+string name
+---
+bool success
+string message
+bool available
+bool readable
+bool writable
+string type
+# Text preserves full-width integers. Empty optional fields are unspecified.
+string value
+string unit
+string minimum
+string maximum
+string increment
+string[] choices

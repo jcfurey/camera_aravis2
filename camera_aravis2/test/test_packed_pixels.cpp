@@ -27,13 +27,43 @@
 // POSSIBILITY OF SUCH DAMAGE.
 
 #include <gtest/gtest.h>
+#if __has_include(<cv_bridge/cv_bridge.hpp>)
+#include <cv_bridge/cv_bridge.hpp>
+#else
+#include <cv_bridge/cv_bridge.h>
+#endif
 
 #include <memory>
+#include <vector>
 
 #include "camera_aravis2/conversion_utils.h"
 
 namespace camera_aravis2
 {
+TEST(PackedPixels, BothYuv422LayoutsDecodeRed)
+{
+    for (const bool yuy2 : {true, false})
+    {
+        auto image = std::make_shared<sensor_msgs::msg::Image>();
+        image->width = 2;
+        image->height = 1;
+        image->step = 4;
+        image->data = yuy2 ? std::vector<uint8_t>{82, 90, 82, 240} :
+                             std::vector<uint8_t>{90, 82, 240, 82};
+        sensor_msgs::msg::Image::SharedPtr out;
+        CONVERSIONS_DICTIONARY.at(yuy2 ? "YUV422_8" : "YUV422_8_UYVY")(image, out);
+        ASSERT_TRUE(out);
+        const auto rgb = cv_bridge::toCvCopy(out, "rgb8");
+        for (int x = 0; x < 2; ++x)
+        {
+            const auto pixel = rgb->image.at<cv::Vec3b>(0, x);
+            EXPECT_GE(pixel[0], 250);
+            EXPECT_LE(pixel[1], 3);
+            EXPECT_LE(pixel[2], 3);
+        }
+    }
+}
+
 TEST(PackedPixels, LegacyTenBitPairsRetainEveryCodeInBothPositions)
 {
     auto image = std::make_shared<sensor_msgs::msg::Image>();

@@ -105,7 +105,9 @@ class CameraAravisNodeBase : public rclcpp::Node
      *
      * @return True if successful. False, otherwise.
      */
-    [[nodiscard]] bool discoverAndOpenCameraDevice();
+    [[nodiscard]] bool discoverAndOpenCameraDevice(int max_retries = 10,
+                                                   const std::string& identity = {});
+    void releaseCamera();
 
     /**
      * @brief Get nested parameter with 'param_name' with 'parent_name' as parent.
@@ -310,7 +312,7 @@ class CameraAravisNodeBase : public rclcpp::Node
      */
     static std::string constructCameraGuidStr(ArvCamera* p_cam);
 
-    bool cameraUnavailable() const { return camera_unavailable_->load(); }
+    bool cameraUnavailable() const { return std::atomic_load(&camera_unavailable_)->load(); }
 
     //--- MEMBER DECLARATION ---//
 
@@ -319,7 +321,7 @@ class CameraAravisNodeBase : public rclcpp::Node
     std::atomic<bool> is_initialized_;
 
     /// Discovery/open failed or Aravis signalled loss of control.
-    const std::shared_ptr<std::atomic<bool>> camera_unavailable_ =
+    std::shared_ptr<std::atomic<bool>> camera_unavailable_ =
       std::make_shared<std::atomic<bool>>(false);
 
     /// Logger object of node.

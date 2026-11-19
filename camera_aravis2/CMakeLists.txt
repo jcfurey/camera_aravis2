@@ -35,6 +35,7 @@ find_package(image_transport REQUIRED)
 find_package(camera_info_manager REQUIRED)
 
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(camera_aravis2_msgs REQUIRED)
@@ -70,6 +71,7 @@ set(LIBRARIES
   ${diagnostic_msgs_TARGETS}
   ${sensor_msgs_TARGETS}
   ${std_msgs_TARGETS}
+  ${std_srvs_TARGETS}
   ${camera_info_manager_TARGETS}
   ${cv_bridge_TARGETS}
   ${image_transport_TARGETS}
@@ -85,6 +87,9 @@ add_library(${LIBRARY_NAME} SHARED
   src/camera_driver_uv.cpp
   src/camera_driver.cpp
   src/dynamic_features.cpp
+  src/camera_services.cpp
+  src/measurement_metadata.cpp
+  src/camera_recovery.cpp
   src/camera_xml_exporter.cpp
   src/conversion_utils.cpp
   src/error.cpp

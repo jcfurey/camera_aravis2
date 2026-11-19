@@ -114,7 +114,8 @@ class CameraDriverGv : public CameraDriver
     void postFrameProcessingCallback(const uint stream_id) override;
 
     /// Sample the PTP data set once for all streams.
-    void checkPtpState();
+    bool configureTimestampSource() override;
+    void checkPtpState() override;
 
     //--- MEMBER DECLARATION ---//
 

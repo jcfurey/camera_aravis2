@@ -142,6 +142,7 @@ void CameraDriver::publishStreamDiagnostics()
             status.name = get_fully_qualified_name();
             status.hardware_id = guid_;
         }
+        recovery_requested_ = false;
         for (auto& stream : streams_)
         {
             auto& status = msg.status.emplace_back();
@@ -162,6 +163,9 @@ void CameraDriver::publishStreamDiagnostics()
                     stream.last_frame_activity = sample;
                 const bool stalled = stall_timeout_.count() > 0 &&
                   sample - stream.last_frame_activity >= stall_timeout_;
+                if (recovery_timer_ && stalled && current_num_subscribers_ > 0 &&
+                    stream.frame_expectation == FrameExpectation::Continuous)
+                    recovery_requested_ = true;
                 status = counters.describeInterval(stream.previous_counters, interval,
                                                    current_num_subscribers_ > 0,
                                                    ARV_IS_GV_STREAM(stream.p_arv_stream),
@@ -191,11 +195,13 @@ void CameraDriver::publishStreamDiagnostics()
                 addValue(status, "buffer_limit", max_stream_buffers_);
                 stream.previous_counters = counters;
             }
+            addValue(status, "reconnects", reconnects_);
             status.name = std::string(get_fully_qualified_name()) + ": " + stream.name;
             status.hardware_id = hardware_id_;
         }
     }
-    stream_diagnostic_pub_->publish(msg);
+    if (stream_diagnostic_pub_)
+        stream_diagnostic_pub_->publish(msg);
 }
 
 void CameraDriver::printStreamStatistics() const

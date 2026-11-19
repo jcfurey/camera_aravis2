@@ -58,6 +58,8 @@ extern "C"
 #include <rcl_interfaces/msg/set_parameters_result.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp/service.hpp>
+#include <std_srvs/srv/trigger.hpp>
+#include <camera_aravis2_msgs/srv/get_feature.hpp>
 
 // camera_aravis2
 #include "camera_aravis2/calibration_geometry.h"
@@ -134,6 +136,7 @@ class CameraDriver : public CameraAravisNodeBase
         /// Conversion function to convert pixel format from sensor into image message.
         ConversionFunction cvt_pixel_format;
         ArvPixelFormat pixel_format_code{};
+        camera_aravis2_msgs::msg::FrameMetadata measurement_snapshot;
 
         /// Image publisher.
         image_transport::Publisher image_pub;
@@ -409,6 +412,11 @@ class CameraDriver : public CameraAravisNodeBase
      * @return True if successful. False, otherwise.
      */
     [[nodiscard]] bool initializeServices();
+    void triggerImage(std_srvs::srv::Trigger::Response& response);
+    void describeFeature(const std::string& name,
+                         camera_aravis2_msgs::srv::GetFeature::Response& response);
+    bool startAcquisition();
+    camera_aravis2_msgs::msg::FrameMetadata measurementSnapshot(const Stream& stream) const;
 
     /**
      * @brief Discover number of available camera streams.
@@ -471,6 +479,24 @@ class CameraDriver : public CameraAravisNodeBase
     void publishStreamDiagnostics();
     static StreamCounters readStreamCounters(const Stream& stream);
     void stopCameraStreams();
+    void startCameraWorkers();
+    virtual bool configureTimestampSource() { return true; }
+    virtual void checkPtpState() {}
+    void checkRecovery();
+    bool reopenCamera();
+    struct SavedFeature
+    {
+        rclcpp::Parameter value;
+        std::vector<std::pair<std::string, std::string>> selectors;
+    };
+    bool captureSelectors(SavedFeature& setting) const;
+    bool replayFeatures();
+    std::vector<SavedFeature> saved_features_;
+    std::optional<std::array<int, 4>> saved_region_;
+    rclcpp::TimerBase::SharedPtr recovery_timer_;
+    std::atomic<bool> session_started_{false};
+    bool recovery_requested_ = false;
+    uint64_t reconnects_ = 0;
 
     /**
      * Read and publish camera diagnostics.
@@ -584,6 +610,9 @@ class CameraDriver : public CameraAravisNodeBase
     /// Service to calculate white balance
     rclcpp::Service<camera_aravis2_msgs::srv::CalculateWhiteBalance>::SharedPtr
       p_white_balance_srv_;
+
+    rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr trigger_service_;
+    rclcpp::Service<camera_aravis2_msgs::srv::GetFeature>::SharedPtr feature_service_;
 
     /// Callback handle to adjust parameters
     OnSetParametersCallbackHandle::SharedPtr p_parameter_callback_handle_;

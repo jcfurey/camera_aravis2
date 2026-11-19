@@ -64,7 +64,8 @@ bool needsStoppedStream(const rclcpp::Parameter& param)
     return samplingFeature(name) || name == "PixelFormat" || name == "Width" ||
       name == "Height" || name.rfind("Offset", 0) == 0 || name.rfind("Center", 0) == 0 ||
       name.rfind("Chunk", 0) == 0 || name.rfind("Trigger", 0) == 0 ||
-      name == "AcquisitionMode" || name == "SourceSelector";
+      name == "AcquisitionMode" || name == "AcquisitionStartMode" || name == "ADCBitDepth" ||
+      name.rfind("BlackLevel", 0) == 0 || name == "SourceSelector";
 }
 
 bool matches(const rclcpp::Parameter& actual, const rclcpp::Parameter& requested)
@@ -225,9 +226,11 @@ bool CameraDriver::resumeStream(Stream& stream, bool acquiring)
         readCalibrationGeometry(stream);
     }
     stream.frame_expectation = readFrameExpectation();
+    stream.measurement_snapshot = measurementSnapshot(stream);
+    recovery_requested_ = false;
     startBufferWorker(0, size);
     arv_stream_start_thread(stream.p_arv_stream);
-    if (acquiring && !executeCommand("AcquisitionStart"))
+    if (acquiring && !startAcquisition())
     {
         executeCommand("AcquisitionStop");
         stopBufferWorker(stream);
@@ -268,7 +271,7 @@ bool CameraDriver::applyDynamicFeatures(const std::vector<rclcpp::Parameter>& fe
         if (!pauseStream(stream))
         {
             reason = "Frame publication is busy, retry the update";
-            if (acquiring && !executeCommand("AcquisitionStart"))
+            if (acquiring && !startAcquisition())
             {
                 reason += ". Could not resume acquisition";
                 camera_unavailable_->store(true);
@@ -279,6 +282,7 @@ bool CameraDriver::applyDynamicFeatures(const std::vector<rclcpp::Parameter>& fe
 
     const bool original_sampling_changed = output_sampling_changed_;
     std::vector<rclcpp::Parameter> undo;
+    std::vector<SavedFeature> accepted;
     for (const auto& requested : features)
     {
         rclcpp::Parameter actual;
@@ -287,6 +291,15 @@ bool CameraDriver::applyDynamicFeatures(const std::vector<rclcpp::Parameter>& fe
         {
             reason = "Could not read " + name;
             break;
+        }
+        if (recovery_timer_)
+        {
+            accepted.push_back({actual, {}});
+            if (!captureSelectors(accepted.back()))
+            {
+                reason = "Could not snapshot selectors for " + name;
+                break;
+            }
         }
         if (matches(actual, requested))
             continue;
@@ -298,13 +311,42 @@ bool CameraDriver::applyDynamicFeatures(const std::vector<rclcpp::Parameter>& fe
             reason = "Camera rejected or adjusted " + name;
             break;
         }
+        if (recovery_timer_)
+            accepted.back().value = actual;
         if (samplingFeature(name))
             output_sampling_changed_ = true;
+    }
+    auto region = saved_region_;
+    for (const auto& param : accepted)
+    {
+        const auto& name = param.value.get_name();
+        if ((rebuild && region) || name == "Width" || name == "Height" ||
+            name == "OffsetX" || name == "OffsetY")
+        {
+            region = readRegion(p_camera_);
+            if (!region)
+                reason = "Could not snapshot configured ROI";
+            break;
+        }
     }
     if (reason.empty() && rebuild && !resumeStream(stream, acquiring))
         reason = "Could not resume acquisition with the new stream layout";
     if (reason.empty())
+    {
+        saved_region_ = region;
+        for (auto& entry : accepted)
+        {
+            const auto same = [&](const SavedFeature& old)
+            {
+                return old.value.get_name() == entry.value.get_name() &&
+                  old.selectors == entry.selectors;
+            };
+            saved_features_.erase(std::remove_if(saved_features_.begin(), saved_features_.end(),
+                                                 same), saved_features_.end());
+            saved_features_.push_back(std::move(entry));
+        }
         return true;
+    }
 
     const auto restoreValue = [&](const rclcpp::Parameter& value)
     {

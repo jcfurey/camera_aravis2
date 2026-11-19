@@ -102,8 +102,7 @@ CameraDriverUv::CameraDriverUv(const rclcpp::NodeOptions& options) :
     printCameraConfiguration();
 
     //--- spawn camera stream in thread, so that initialization is not blocked
-    is_spawning_         = true;
-    spawn_stream_thread_ = std::thread(&CameraDriverUv::spawnCameraStreams, this);
+    startCameraWorkers();
 }
 
 //==================================================================================================

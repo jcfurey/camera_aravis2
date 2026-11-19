@@ -74,6 +74,12 @@ CameraAravisNodeBase::CameraAravisNodeBase(const std::string& name,
 //==================================================================================================
 CameraAravisNodeBase::~CameraAravisNodeBase()
 {
+    releaseCamera();
+    RCLCPP_INFO(logger_, "Node has shut down.");
+}
+
+void CameraAravisNodeBase::releaseCamera()
+{
     if (control_lost_handler_)
         g_signal_handler_disconnect(p_device_, control_lost_handler_);
     // Release only this node's camera. The Aravis interfaces and GenICam registry are
@@ -81,7 +87,9 @@ CameraAravisNodeBase::~CameraAravisNodeBase()
     if (p_camera_)
         g_object_unref(p_camera_);
 
-    RCLCPP_INFO(logger_, "Node has shut down.");
+    control_lost_handler_ = 0;
+    p_device_ = nullptr;
+    p_camera_ = nullptr;
 }
 
 //==================================================================================================
@@ -130,7 +138,8 @@ void CameraAravisNodeBase::setupParameters()
 }
 
 //==================================================================================================
-[[nodiscard]] bool CameraAravisNodeBase::discoverAndOpenCameraDevice()
+[[nodiscard]] bool CameraAravisNodeBase::discoverAndOpenCameraDevice(
+  int max_retries, const std::string& identity)
 {
     // Guarded error object
     GuardedGError err;
@@ -144,9 +153,28 @@ void CameraAravisNodeBase::setupParameters()
         return false;
     }
 
-    const int MAX_RETRIES = 10;
+    // An initially unspecified guid should follow the original device through rediscovery.
+    if (guid_.empty() && !identity.empty())
+    {
+        for (guint i = 0; i < arv_get_n_devices(); ++i)
+        {
+            const auto* vendor = arv_get_device_vendor(i);
+            const auto* model = arv_get_device_model(i);
+            const auto* serial = arv_get_device_serial_nbr(i);
+            const auto* id = arv_get_device_id(i);
+            if (vendor && model && serial && id &&
+                identity == std::string(vendor) + "-" + model + "-" + serial)
+            {
+                guid_ = id;
+                break;
+            }
+        }
+        if (guid_.empty())
+            return false;
+    }
+
     int tryCount          = 1;
-    while (rclcpp::ok(context) && !p_camera_ && tryCount <= MAX_RETRIES)
+    while (rclcpp::ok(context) && !p_camera_ && tryCount <= max_retries)
     {
         if (guid_ == "")
         {
@@ -163,10 +191,10 @@ void CameraAravisNodeBase::setupParameters()
         if (!p_camera_)
         {
             CHECK_GERROR(err, logger_);
-            if (tryCount < MAX_RETRIES && rclcpp::ok(context))
+            if (tryCount < max_retries && rclcpp::ok(context))
             {
                 RCLCPP_WARN(logger_, "Unable to open camera. Retrying (%i/%i) ...",
-                            tryCount, MAX_RETRIES);
+                            tryCount, max_retries);
                 rclcpp::sleep_for(std::chrono::seconds(1), context);
             }
             tryCount++;

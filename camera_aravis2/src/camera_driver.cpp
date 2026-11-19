@@ -158,11 +158,11 @@ int CameraDriver::spinStandalone()
         rclcpp::executors::SingleThreadedExecutor executor(options);
         executor.add_node(get_node_base_interface());
         // Control loss and stream setup can complete on Aravis threads without a ROS event.
-        while (rclcpp::ok(options.context) && !cameraUnavailable() &&
-               (isSpawning() || isInitialized()))
+        while (rclcpp::ok(options.context) && ((recovery_timer_ && session_started_) ||
+               (!cameraUnavailable() && (isSpawning() || isInitialized()))))
             executor.spin_once(std::chrono::milliseconds(100));
     }
-    if (cameraUnavailable())
+    if (rclcpp::ok(options.context) && cameraUnavailable())
         return EX_TEMPFAIL;
     return !rclcpp::ok(options.context) || isInitialized() ? EXIT_SUCCESS : EXIT_FAILURE;
 }
@@ -192,6 +192,12 @@ void CameraDriver::setupParameters()
     period_desc.description = "Free-running silence before a stream error in ms. Zero disables.";
     stall_timeout_ = std::chrono::milliseconds(
       declare_parameter<int>("stream_stall_timeout_ms", 5000, period_desc));
+    rcl_interfaces::msg::ParameterDescriptor recovery_desc;
+    recovery_desc.read_only = true;
+    recovery_desc.description = "Reopen a previously connected camera after control loss or stall.";
+    if (declare_parameter<bool>("auto_reconnect", true, recovery_desc))
+        recovery_timer_ = create_wall_timer(std::chrono::seconds(2),
+          std::bind(&CameraDriver::checkRecovery, this));
     if (period > 0)
     {
         stream_diagnostic_pub_ =
@@ -199,6 +205,10 @@ void CameraDriver::setupParameters()
         stream_diagnostic_timer_ = create_wall_timer(std::chrono::milliseconds(period),
           std::bind(&CameraDriver::publishStreamDiagnostics, this));
     }
+
+    if (recovery_timer_ && !stream_diagnostic_timer_)
+        stream_diagnostic_timer_ = create_wall_timer(std::chrono::seconds(1),
+          std::bind(&CameraDriver::publishStreamDiagnostics, this));
 
     auto stream_names_desc = rcl_interfaces::msg::ParameterDescriptor{};
     stream_names_desc.description =
@@ -1281,6 +1291,20 @@ void CameraDriver::filterParameterListNames(
 //==================================================================================================
 bool CameraDriver::initializeServices()
 {
+    using Trigger = std_srvs::srv::Trigger;
+    using Feature = camera_aravis2_msgs::srv::GetFeature;
+    trigger_service_ = create_service<Trigger>("~/trigger_image",
+      [this](const Trigger::Request::SharedPtr, Trigger::Response::SharedPtr response)
+      {
+          std::lock_guard<std::mutex> lock(acquisition_mutex_);
+          triggerImage(*response);
+      });
+    feature_service_ = create_service<Feature>("~/get_feature",
+      [this](Feature::Request::SharedPtr request, Feature::Response::SharedPtr response)
+      {
+          std::lock_guard<std::mutex> lock(acquisition_mutex_);
+          describeFeature(request->name, *response);
+      });
     //--- initialize service to calculate white balance
     p_white_balance_srv_ =
       this->create_service<camera_aravis2_msgs::srv::CalculateWhiteBalance>(
@@ -1324,8 +1348,8 @@ void CameraDriver::handleMessageSubscriptionChange()
             stream.last_frame_activity = std::chrono::steady_clock::now();
         RCLCPP_INFO(logger_, "|-> Acquisition start.");
 
-        arv_device_execute_command(p_device_, "AcquisitionStart", err.ref());
-        CHECK_GERROR_MSG(err, logger_, "In executing 'AcquisitionStart'.");
+        if (!startAcquisition())
+            camera_unavailable_->store(true);
     }
     //--- if there are no subscribers now and there were subscribers before, stop
     //--- acquisition
@@ -1826,6 +1850,22 @@ void CameraDriver::publishCameraDiagnosticsLoop(double rate)
 }
 
 //==================================================================================================
+void CameraDriver::startCameraWorkers()
+{
+    is_spawning_         = true;
+    spawn_stream_thread_ = std::thread([this]()
+    {
+        spawnCameraStreams();
+        if (!isInitialized() || !ptp_lock_)
+            return;
+
+        // Keep polling on the startup thread so slow camera reads do not block the
+        // executor or frame processing. stopCameraStreams wakes and joins this thread.
+        while (!waitForWorkerStop(std::chrono::seconds(1)))
+            checkPtpState();
+    });
+}
+
 void CameraDriver::spawnCameraStreams()
 {
     GuardedGError err;
@@ -1842,8 +1882,13 @@ void CameraDriver::spawnCameraStreams()
             if (streams_.size() == 1 ||
                 setFeatureValue<std::string>("SourceSelector", "Source" + std::to_string(i)))
             {
-                readCalibrationGeometry(stream);
+                if (!session_started_ || calibration_options_.full_sensor)
+                {
+                    stream.calibration_geometry = {};
+                    readCalibrationGeometry(stream);
+                }
                 stream.frame_expectation = readFrameExpectation();
+                stream.measurement_snapshot = measurementSnapshot(stream);
             }
         }
 
@@ -1937,6 +1982,9 @@ void CameraDriver::spawnCameraStreams()
                     stream.previous_counters = readStreamCounters(stream);
         last_stream_sample_ = std::chrono::steady_clock::now();
         this->is_initialized_ = true;
+        if (session_started_)
+            ++reconnects_;
+        session_started_ = true;
         is_spawning_ = false;
     }
 
@@ -1973,7 +2021,7 @@ void CameraDriver::processStreamBuffer(const uint stream_id, FrameChunks chunks)
     RCLCPP_INFO(logger_, "Started processing thread for stream %i (%s)", stream_id,
                 stream.name.c_str());
 
-    camera_aravis2_msgs::msg::FrameMetadata metadata;
+    auto metadata = stream.measurement_snapshot;
     metadata.hardware_id = hardware_id_;
     while (true)
     {
@@ -2037,6 +2085,10 @@ void CameraDriver::processStreamBuffer(const uint stream_id, FrameChunks chunks)
             p_img_msg = p_cvt_img_msg;
         }
 
+        if (!metadata.storage_bit_depth && stream.cvt_pixel_format)
+            metadata.storage_bit_depth =
+              sensor_msgs::image_encodings::bitDepth(p_img_msg->encoding);
+
         //--- fill camera_info message
         fillCameraInfoMsg(stream, p_img_msg);
 
@@ -2049,6 +2101,24 @@ void CameraDriver::processStreamBuffer(const uint stream_id, FrameChunks chunks)
         metadata.device_timestamp_ns = arv_buffer_get_timestamp(p_arv_buffer);
         metadata.host_receive_timestamp_ns = arv_buffer_get_system_timestamp(p_arv_buffer);
         metadata.pixel_format = arv_buffer_get_image_pixel_format(p_arv_buffer);
+        metadata.roi_offset_x = stream.image_roi.x;
+        metadata.roi_offset_y = stream.image_roi.y;
+        {
+            std::lock_guard<std::mutex> lock(ptp_mutex_);
+            metadata.ptp_locked = ptp_lock_ &&
+              ptp_lock_->covers(metadata.host_receive_timestamp_ns, PtpLock::Clock::now());
+        }
+        const auto& snapshot = stream.measurement_snapshot;
+        metadata.intensity_range_source = snapshot.intensity_range_source;
+        metadata.intensity_min = snapshot.intensity_min;
+        metadata.intensity_max = snapshot.intensity_max;
+        if (metadata.pixel_dynamic_range_valid && metadata.pixel_bit_depth &&
+            metadata.pixel_dynamic_range_max < (uint64_t{1} << metadata.pixel_bit_depth))
+        {
+            metadata.intensity_range_source = "chunk";
+            metadata.intensity_min = metadata.pixel_dynamic_range_min;
+            metadata.intensity_max = metadata.pixel_dynamic_range_max;
+        }
         stream.p_frame_metadata_pub->publish(metadata);
 
         ++stream.published_frames;
@@ -2446,10 +2516,11 @@ void CameraDriver::stopCameraStreams()
     //--- unref pointers
     for (uint i = 0; i < streams_.size(); i++)
     {
-        if (streams_[i].p_arv_stream)
-            g_object_unref(streams_[i].p_arv_stream);
+        g_clear_object(&streams_[i].p_arv_stream);
+        streams_[i].p_buffer_pool.reset();
     }
 
+    new_buffer_cb_data_ptrs.clear();
     //--- camera / device object is unreferences in parent class
 }
 

@@ -112,15 +112,6 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
     p_tl_control_    = std::dynamic_pointer_cast<GenTransportLayerControl>(p_gv_tl_control_);
 
     CHECK_SUCCESS(setTransportLayerControlSettings(), logger_);
-    timestamp_source_ = timestampSource(get_parameter("timestamp_mode").as_string(),
-                                        p_gv_tl_control_->is_ptp_enable);
-
-    if (timestamp_source_ == TimestampSource::Ptp && !p_gv_tl_control_->is_ptp_enable)
-    {
-        RCLCPP_ERROR(logger_, "timestamp_mode=ptp requires PtpEnable to be true on the camera");
-        return;
-    }
-
     //--- set image format control settings
     CHECK_SUCCESS(setImageFormatControlSettings(), logger_);
 
@@ -140,29 +131,13 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
     setupCameraDiagnosticPublisher();
 
     //--- check ptp
-    if (p_gv_tl_control_->is_ptp_enable)
-    {
-        ptp_lock_.emplace(std::chrono::seconds(window), tolerance);
-        checkPtpState();
-        p_gv_tl_control_->ptp_status = ptp_lock_->sample().status;
-    }
+    CHECK_SUCCESS(configureTimestampSource(), logger_);
 
     //--- print currently applied camera configuration
     printCameraConfiguration();
 
     //--- spawn camera stream in thread, so that initialization is not blocked
-    is_spawning_         = true;
-    spawn_stream_thread_ = std::thread([this]()
-    {
-        spawnCameraStreams();
-        if (!isInitialized() || !ptp_lock_)
-            return;
-
-        // Keep polling on the startup thread so slow camera reads do not block the
-        // executor or frame processing. stopCameraStreams wakes and joins this thread.
-        while (!waitForWorkerStop(std::chrono::seconds(1)))
-            checkPtpState();
-    });
+    startCameraWorkers();
 }
 
 //==================================================================================================
@@ -316,6 +291,32 @@ void CameraDriverGv::postFrameProcessingCallback(const uint stream_id)
 }
 
 //==================================================================================================
+bool CameraDriverGv::configureTimestampSource()
+{
+    p_gv_tl_control_->is_ptp_enable = false;
+    getFeatureValue<bool>("PtpEnable", p_gv_tl_control_->is_ptp_enable);
+    ptp_lock_.reset();
+    timestamp_source_ = timestampSource(get_parameter("timestamp_mode").as_string(),
+                                        p_gv_tl_control_->is_ptp_enable);
+
+    if (timestamp_source_ == TimestampSource::Ptp && !p_gv_tl_control_->is_ptp_enable)
+    {
+        RCLCPP_ERROR(logger_, "timestamp_mode=ptp requires PtpEnable to be true on the camera");
+        return false;
+    }
+
+    if (p_gv_tl_control_->is_ptp_enable)
+    {
+        const auto window = get_parameter("ptp_offset_window_s").as_int();
+        const auto tolerance = get_parameter("ptp_max_offset_ns").as_int();
+        ptp_lock_.emplace(std::chrono::seconds(window), tolerance);
+        checkPtpState();
+        p_gv_tl_control_->ptp_status = ptp_lock_->sample().status;
+    }
+
+    return true;
+}
+
 void CameraDriverGv::checkPtpState()
 {
     const auto start = PtpLock::Clock::now();
