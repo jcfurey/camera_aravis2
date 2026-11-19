@@ -31,6 +31,7 @@
 // Std
 #include <chrono>
 #include <iostream>
+#include <limits>
 #include <thread>
 
 // ROS
@@ -51,6 +52,16 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
 {
     //--- setup parameters
     setupParameters();
+
+    rcl_interfaces::msg::ParameterDescriptor buffer_desc;
+    buffer_desc.read_only = true;
+    buffer_desc.description = "GigE stream UDP receive buffer in bytes. Zero uses the OS default.";
+    rcl_interfaces::msg::IntegerRange buffer_range;
+    buffer_range.from_value = 0;
+    buffer_range.to_value = std::numeric_limits<gint>::max();
+    buffer_range.step = 1;
+    buffer_desc.integer_range.push_back(buffer_range);
+    declare_parameter<int64_t>("stream_socket_buffer_size", 0, buffer_desc);
 
     is_verbose_enable_ = get_parameter("verbose").as_bool();
 
@@ -284,16 +295,14 @@ void CameraDriverGv::tuneArvStream(ArvStream* p_stream) const
         return;
     }
 
-    gboolean b_auto_buffer               = FALSE;
+    const auto buffer_size = get_parameter("stream_socket_buffer_size").as_int();
     gboolean b_packet_resend             = TRUE;
     unsigned int timeout_packet          = 40;  // milliseconds
     unsigned int timeout_frame_retention = 200;
 
-    if (b_auto_buffer)
-        g_object_set(p_stream, "socket-buffer",
-                     ARV_GV_STREAM_SOCKET_BUFFER_AUTO,
-                     "socket-buffer-size", 0,
-                     NULL);
+    if (buffer_size > 0)
+        g_object_set(p_stream, "socket-buffer", ARV_GV_STREAM_SOCKET_BUFFER_FIXED,
+                     "socket-buffer-size", static_cast<gint>(buffer_size), nullptr);
     if (!b_packet_resend)
         g_object_set(p_stream, "packet-resend",
                      b_packet_resend
