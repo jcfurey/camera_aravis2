@@ -22,3 +22,11 @@ string exposure_unit
 bool gain_valid
 float64 gain
 string gain_unit
+
+# Active sequencer set and digital-line status reported in this frame's chunks.
+# Check each valid flag independently. Both fields read zero when unavailable.
+# Set zero and an all-low line mask are also valid camera readings.
+bool sequencer_set_valid
+uint64 sequencer_set
+bool line_status_valid
+uint64 line_status

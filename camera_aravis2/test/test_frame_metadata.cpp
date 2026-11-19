@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "camera_aravis2/camera_driver.h"
+#include "camera_aravis2/frame_io_chunks.h"
 
 namespace camera_aravis2
 {
@@ -72,6 +73,67 @@ class MemoryCamera : public CameraDriver
     void postFrameProcessingCallback(uint) override {}
 };
 }  // namespace
+
+TEST(FrameMetadata, IntegerChunksPreserveBitsAndClearUnavailableValues)
+{
+    // Fixed GenICam values exercise the Aravis integer parser without a network camera.
+    // The parser XML varies to model independently missing fields in successive reads.
+    const auto xml = [](const std::string& sequence, const std::string& lines)
+    {
+        return "<RegisterDescription>" + sequence + lines + "</RegisterDescription>";
+    };
+    const auto integer = [](const std::string& name, const std::string& value)
+    {
+        return "<Integer Name=\"" + name + "\"><Value>" + value + "</Value></Integer>";
+    };
+    const auto sequence = integer("ChunkSequencerSetActive", "9007199254740993");
+    const auto lines = integer("ChunkLineStatusAll", "-9223372036854775807");
+    const auto schema = xml(sequence, lines);
+    std::unique_ptr<ArvGc, decltype(&g_object_unref)> gc(
+      arv_gc_new(nullptr, schema.data(), schema.size()), g_object_unref);
+    ASSERT_TRUE(gc);
+    FrameIoChunks io(gc.get());
+    ASSERT_TRUE(io.supported());
+
+    std::unique_ptr<ArvBuffer, decltype(&g_object_unref)> buffer(
+      arv_buffer_new_allocate(1), g_object_unref);
+    camera_aravis2_msgs::msg::FrameMetadata msg;
+    const auto read = [&](const std::string& features)
+    {
+        std::unique_ptr<ArvChunkParser, decltype(&g_object_unref)> parser(
+          arv_chunk_parser_new(features.data(), features.size()), g_object_unref);
+        ASSERT_TRUE(parser);
+        io.read(parser.get(), buffer.get(), msg);
+    };
+    read(schema);
+    EXPECT_TRUE(msg.sequencer_set_valid);
+    EXPECT_EQ(msg.sequencer_set, 9007199254740993ULL);
+    EXPECT_TRUE(msg.line_status_valid);
+    EXPECT_EQ(msg.line_status, 0x8000000000000001ULL);
+
+    read(xml(integer("ChunkSequencerSetActive", "-1"), integer("ChunkLineStatusAll", "0")));
+    EXPECT_FALSE(msg.sequencer_set_valid);
+    EXPECT_EQ(msg.sequencer_set, 0u);
+    EXPECT_TRUE(msg.line_status_valid);
+    EXPECT_EQ(msg.line_status, 0u);
+
+    read(xml(integer("ChunkSequencerSetActive", "0"), ""));
+    EXPECT_TRUE(msg.sequencer_set_valid);
+    EXPECT_EQ(msg.sequencer_set, 0u);
+    EXPECT_FALSE(msg.line_status_valid);
+    EXPECT_EQ(msg.line_status, 0u);
+
+    read(xml("", lines));
+    EXPECT_FALSE(msg.sequencer_set_valid);
+    EXPECT_TRUE(msg.line_status_valid);
+    EXPECT_EQ(msg.line_status, 0x8000000000000001ULL);
+
+    io.read(nullptr, buffer.get(), msg);
+    EXPECT_FALSE(msg.sequencer_set_valid);
+    EXPECT_EQ(msg.sequencer_set, 0u);
+    EXPECT_FALSE(msg.line_status_valid);
+    EXPECT_EQ(msg.line_status, 0u);
+}
 
 TEST(FrameMetadata, MetadataOnlyAcquisitionAndMatchingImageHeaders)
 {
@@ -127,6 +189,10 @@ TEST(FrameMetadata, MetadataOnlyAcquisitionAndMatchingImageHeaders)
           EXPECT_FALSE(msg.gain_valid);
           EXPECT_TRUE(std::isnan(msg.gain));
           EXPECT_TRUE(msg.gain_unit.empty());
+          EXPECT_FALSE(msg.sequencer_set_valid);
+          EXPECT_EQ(msg.sequencer_set, 0u);
+          EXPECT_FALSE(msg.line_status_valid);
+          EXPECT_EQ(msg.line_status, 0u);
           frames.emplace(stamp, msg.frame_id);
       });
     ASSERT_TRUE(wait([&]() { return driver->acquiring() && frames.size() >= 3; }));

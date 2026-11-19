@@ -246,6 +246,12 @@ NaN. The unit strings come from the camera XML and can be empty. Zero gain is
 a valid reading. The published image contains only pixel rows. For packed
 formats, choose an ROI width that produces byte-aligned rows.
 
+`ChunkSequencerSetActive` supplies the camera's sequencer set index for the frame.
+`ChunkLineStatusAll` supplies its digital-line bitmask. The camera defines the
+line assigned to each bit. Check `sequencer_set_valid` and `line_status_valid`
+independently. Set zero and an all-low mask are valid readings when their flags
+are true. A camera can report set zero while its sequencer is off.
+
 The driver reads the camera's existing chunk configuration by default. On a
 LUCID Triton TRI028S-C, the following ROS parameter file enables image,
 exposure and gain chunks during driver startup. Camera models can offer
@@ -263,6 +269,17 @@ different choices for `ChunkSelector`.
         "#05_ChunkEnable": true
         "#06_ChunkSelector": Gain
         "#07_ChunkEnable": true
+```
+
+To capture the sequencer set and digital lines as well, append the following
+entries under the same `END` mapping. These selectors enable reporting for
+each frame. The camera's sequencer and line configuration are separate settings.
+
+```yaml
+        "#08_ChunkSelector": SequencerSetActive
+        "#09_ChunkEnable": true
+        "#10_ChunkSelector": LineStatusAll
+        "#11_ChunkEnable": true
 ```
 
 ### Automatic reconnect

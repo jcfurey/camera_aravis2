@@ -42,6 +42,8 @@
 #include <rcl_interfaces/msg/integer_range.hpp>
 #include <rclcpp/time.hpp>
 
+#include "camera_aravis2/frame_io_chunks.h"
+
 /// Conversions from integers to Arv types.
 static const char* ARV_BUFFER_STATUS_FROM_INT[] =
   {"ARV_BUFFER_STATUS_SUCCESS", "ARV_BUFFER_STATUS_CLEARED",
@@ -58,9 +60,10 @@ class FrameChunks
   public:
     explicit FrameChunks(ArvCamera* camera) :
       exposure_(arv_camera_get_device(camera), "ChunkExposureTime"),
-      gain_(arv_camera_get_device(camera), "ChunkGain")
+      gain_(arv_camera_get_device(camera), "ChunkGain"),
+      io_(arv_device_get_genicam(arv_camera_get_device(camera)))
     {
-        if (exposure_.supported || gain_.supported)
+        if (exposure_.supported || gain_.supported || io_.supported())
             parser_.reset(arv_camera_create_chunk_parser(camera));
     }
 
@@ -74,6 +77,7 @@ class FrameChunks
         msg.gain_valid = std::isfinite(msg.gain);
         msg.exposure_unit = exposure_.unit;
         msg.gain_unit = gain_.unit;
+        io_.read(parser, buffer, msg);
     }
 
   private:
@@ -114,6 +118,7 @@ class FrameChunks
     };
 
     Field exposure_, gain_;
+    FrameIoChunks io_;
     std::unique_ptr<ArvChunkParser, decltype(&g_object_unref)> parser_{nullptr, g_object_unref};
 };
 
