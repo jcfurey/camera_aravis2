@@ -88,6 +88,7 @@ add_library(${LIBRARY_NAME} SHARED
   src/conversion_utils.cpp
   src/error.cpp
   src/image_buffer_pool.cpp
+  src/frame_timestamp.cpp
   src/stream_statistics.cpp
 )
 target_link_libraries(${LIBRARY_NAME} ${LIBRARIES})
@@ -152,6 +153,8 @@ if(BUILD_TESTING)
   target_link_libraries(test_calibration_geometry ${LIBRARY_NAME})
   ament_add_gtest(test_stream_buffers test/test_stream_buffers.cpp)
   target_link_libraries(test_stream_buffers ${LIBRARY_NAME})
+  ament_add_gtest(test_frame_timestamp test/test_frame_timestamp.cpp)
+  target_link_libraries(test_frame_timestamp ${LIBRARY_NAME})
   ament_add_gtest(test_stream_statistics test/test_stream_statistics.cpp)
   target_link_libraries(test_stream_statistics ${LIBRARY_NAME})
   find_package(ament_cmake_copyright REQUIRED)

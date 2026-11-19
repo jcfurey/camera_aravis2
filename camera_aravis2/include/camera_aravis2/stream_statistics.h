@@ -47,6 +47,7 @@ struct StreamCounters
     guint64 missing = 0;
     guint64 published = 0;
     guint64 dropped = 0;
+    guint64 timestamp_drops = 0;
 
     diagnostic_msgs::msg::DiagnosticStatus describeInterval(
       const StreamCounters& previous, std::chrono::duration<double> interval,

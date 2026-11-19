@@ -56,7 +56,6 @@ CameraDriver::CameraDriver(const std::string& name, const rclcpp::NodeOptions& o
   is_spawning_(false),
   p_white_balance_srv_(nullptr),
   p_parameter_callback_handle_(nullptr),
-  timestamp_offset_(0.0),
   is_diagnostics_published_(false),
   p_diagnostic_pub_(nullptr),
   current_num_subscribers_(0)
@@ -183,11 +182,18 @@ void CameraDriver::setupParameters()
       "Activate verbose output.";
     declare_parameter<bool>("verbose", false, verbose_desc);
 
+    rcl_interfaces::msg::ParameterDescriptor mode_desc;
+    mode_desc.read_only = true;
+    mode_desc.description = "Frame timestamp mode: auto, host_receive, device or device_offset.";
+    const auto mode = declare_parameter<std::string>("timestamp_mode", "auto", mode_desc);
+    timestamp_source_ = timestampSource(mode, false);
+
     auto timestamp_offset_desc = rcl_interfaces::msg::ParameterDescriptor{};
     timestamp_offset_desc.description =
       "Offset in seconds added to the timestamp of the published image messages.";
-    declare_parameter<double>("timestamp_offset", 0.0, timestamp_offset_desc);
-    timestamp_offset_ = get_parameter("timestamp_offset").as_double();
+    const auto offset = declare_parameter<double>("timestamp_offset", 0.0, timestamp_offset_desc);
+    if (!timestampOffsetNs(offset))
+        throw std::invalid_argument("timestamp_offset must fit in signed 64-bit nanoseconds");
 
     //--- register parameter change callback
     p_parameter_callback_handle_ = add_on_set_parameters_callback(
@@ -1433,7 +1439,12 @@ rcl_interfaces::msg::SetParametersResult CameraDriver::handleDynamicParameterCha
         //--- timestamp offset
         else if (param_name == "timestamp_offset")
         {
-            timestamp_offset_ = param.as_double();
+            if (!timestampOffsetNs(param.as_double()))
+            {
+                retVal.successful = false;
+                retVal.reason = "timestamp_offset must fit in signed 64-bit nanoseconds";
+                return retVal;
+            }
         }
         //--- dynamic camera parameters, check if parameter name is in list of specified dynamic
         //--- parameters
@@ -1889,7 +1900,11 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         }
 
         //--- set meta data of image message
-        fillImageMsgMetadata(p_img_msg, p_arv_buffer, stream.sensor, stream.image_roi);
+        if (!fillImageMsgMetadata(p_img_msg, p_arv_buffer, stream))
+        {
+            ++stream.timestamp_drops;
+            continue;
+        }
 
         //--- convert to ros format
         if (stream.cvt_pixel_format)
@@ -1936,43 +1951,19 @@ bool CameraDriver::adjustImageRoi(ImageRoi& img_roi, ArvBuffer* p_buffer) const
 }
 
 //==================================================================================================
-void CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
-                                        ArvBuffer* p_buffer,
-                                        const Sensor& sensor,
-                                        const ImageRoi& img_roi) const
+bool CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
+                                       ArvBuffer* p_buffer, Stream& stream) const
 {
-    std::shared_ptr<GvTransportLayerControl> p_gv_tl_control =
-      std::dynamic_pointer_cast<GvTransportLayerControl>(p_tl_control_);
-
-    //--- fill header data
-
-    //--- set ptp timestamp if available
-    bool isBufferTimestampSet = false;
-    if (arv_camera_is_gv_device(p_camera_))
-    {
-        if (p_gv_tl_control)
-        {
-            if (p_gv_tl_control->is_ptp_enable)
-            {
-                p_img_msg->header.stamp = rclcpp::Time(arv_buffer_get_timestamp(p_buffer));
-                isBufferTimestampSet    = true;
-            }
-        }
-        else
-        {
-            RCLCPP_WARN(logger_, "%s: Something went wrong when trying to cast pointer of type "
-                                 "GenTransportLayerControl to GevTransportLayerControl. "
-                                 "Using system timestamp.",
-                        __PRETTY_FUNCTION__);
-        }
-    }
-
-    if (!isBufferTimestampSet)
-        p_img_msg->header.stamp = rclcpp::Time(arv_buffer_get_system_timestamp(p_buffer));
-
-    //--- apply timestamp offset
-    p_img_msg->header.stamp = rclcpp::Time(p_img_msg->header.stamp) +
-                              rclcpp::Duration::from_seconds(timestamp_offset_);
+    // Read the committed parameter so an unsuccessful atomic parameter update cannot
+    // change the frame offset. The declaration and set callback validate the conversion.
+    const auto offset = timestampOffsetNs(get_parameter("timestamp_offset").as_double()).value();
+    const auto stamp = stream.frame_timestamp.stamp(timestamp_source_,
+      arv_buffer_get_timestamp(p_buffer), arv_buffer_get_system_timestamp(p_buffer), offset);
+    if (!stamp)
+        return false;
+    p_img_msg->header.stamp = rclcpp::Time(*stamp);
+    const auto& sensor = stream.sensor;
+    const auto& img_roi = stream.image_roi;
     p_img_msg->header.frame_id = sensor.frame_id;
 
     //--- fill image meta data
@@ -1980,6 +1971,7 @@ void CameraDriver::fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_im
     p_img_msg->height   = img_roi.height;
     p_img_msg->encoding = sensor.pixel_format;
     p_img_msg->step     = (img_roi.width * sensor.n_bits_pixel) / 8;
+    return true;
 }
 
 //==================================================================================================

@@ -101,5 +101,19 @@ TEST(StreamStatistics, WarnsOnlyForNewLossAndDistinguishesTransportFromProcessin
     EXPECT_EQ(report.level, Status::WARN);
     EXPECT_EQ(report.message, "Processing drops");
 }
+
+TEST(StreamStatistics, ReportsTimestampDropsInTheirOwnInterval)
+{
+    StreamCounters previous;
+    auto current = previous;
+    ++current.timestamp_drops;
+    const auto report = current.describeInterval(previous, 1s, true, true);
+    EXPECT_EQ(report.level, Status::WARN);
+    EXPECT_EQ(report.message, "Timestamp drops");
+    ++current.failures;
+    EXPECT_EQ(current.describeInterval(previous, 1s, true, true).message,
+              "Transport loss and timestamp drops");
+    EXPECT_EQ(current.describeInterval(current, 1s, false, true).level, Status::OK);
+}
 }  // namespace
 }  // namespace camera_aravis2

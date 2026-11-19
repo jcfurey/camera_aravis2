@@ -69,6 +69,12 @@ The configuration of the camera driver is divided into a driver-specific and Gen
     - Type: String-Array
     - Default: {}
     - Optional. If omitted, it is constructed from the camera GUID located within the current working directory, with the stream name separated by '_' appended to the file name, if more than one streams are instantiated.
+- `timestamp_mode` selects the clock for both Image and CameraInfo at startup. It uses the host or camera clock even when ROS simulated time is active.
+    - `auto` (default) uses device time when the GigE camera reports PTP enabled at startup and host reception time otherwise. Enabling PTP alone does not establish clock lock or epoch agreement.
+    - `host_receive` uses the host wall-clock timestamp Aravis records when receiving the buffer.
+    - `device` forwards the camera's raw frame timestamp. The camera determines its epoch and it can jump after a clock reset.
+    - `device_offset` anchors the first device timestamp of each stream to host reception time. Subsequent stamps follow device intervals, bounded by the receive time, with up to 100 ppm of upward drift correction. A backward step of either clock reanchors that stream. This provides approximate host alignment.
+- `timestamp_offset` adds a signed number of seconds to the selected timestamp (default 0.0, writable during streaming). Frames outside the nonnegative ROS message time range are dropped. In `device_offset` mode a zero input timestamp, duplicate device tick, or repeated aligned stamp also drops the frame. Stream diagnostics expose the effective `timestamp_source` and cumulative `timestamp_drops`. A new timestamp drop raises WARN for that interval.
 - `max_stream_buffers` caps the Aravis receive buffers per stream (default 32, minimum 2). Each stream initially allocates up to ten payload-sized buffers and grows on demand. At the limit, if the input queue is empty, the driver recycles the newest complete frame so the receiver has a buffer for the next frame. Frames already queued retain their order.
 - `stream_diagnostics_period_ms` sets the wall-clock sampling period for the standard ROS stream diagnostics (default 1000 milliseconds, zero disables).
 - `stream_socket_buffer_size` requests the GigE stream's host UDP receive buffer in bytes at startup. The default of zero preserves the host's socket default. Linux caps the request at its receive-buffer limit and may report twice the requested size in `ss -um`.

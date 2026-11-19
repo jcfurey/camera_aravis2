@@ -62,6 +62,7 @@ extern "C"
 #include "camera_aravis2/concurrent_queue.hpp"
 #include "camera_aravis2/config_structs.h"
 #include "camera_aravis2/conversion_utils.h"
+#include "camera_aravis2/frame_timestamp.h"
 #include "camera_aravis2/image_buffer_pool.h"
 #include "camera_aravis2/stream_statistics.h"
 #include <camera_aravis2_msgs/msg/camera_diagnostics.hpp>
@@ -144,6 +145,8 @@ class CameraDriver : public CameraAravisNodeBase
         std::atomic<bool> is_buffer_processed;
         std::atomic<uint64_t> published_frames{0};
         std::atomic<uint64_t> dropped_frames{0};
+        FrameTimestamp frame_timestamp;
+        std::atomic<uint64_t> timestamp_drops{0};
         StreamCounters previous_counters;
 
         /// Thread to process ready stream buffer.
@@ -480,13 +483,11 @@ class CameraDriver : public CameraAravisNodeBase
      *
      * @param[in,out] p_img_msg Pointer to image message.
      * @param[in] p_buffer Pointer to aravis buffer holding the pixel data.
-     * @param[in] sensor Sensor object corresponding to image. Used to set frame_id, image_encoding,
-     * and more.
-     * @param[in] img_roi Image ROI.
+     * @param[in,out] stream Per-stream clock state and image configuration.
+     * @return True when the frame has a representable timestamp.
      */
-    void fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
-                              ArvBuffer* p_buffer, const Sensor& sensor,
-                              const ImageRoi& img_roi) const;
+    bool fillImageMsgMetadata(sensor_msgs::msg::Image::SharedPtr& p_img_msg,
+                              ArvBuffer* p_buffer, Stream& stream) const;
 
     void fillCameraInfoMsg(Stream& stream,
                            const sensor_msgs::msg::Image::SharedPtr& p_img_msg) const;
@@ -569,8 +570,7 @@ class CameraDriver : public CameraAravisNodeBase
     CalibrationOptions calibration_options_;
     std::atomic<bool> calibration_geometry_changed_{false};
 
-    /// Offset in seconds added to the timestamp of the published image messages.
-    double timestamp_offset_;
+    TimestampSource timestamp_source_ = TimestampSource::HostReceive;
 
     /// Atomic flag, indicating if diagnostics are published.
     std::atomic<bool> is_diagnostics_published_;

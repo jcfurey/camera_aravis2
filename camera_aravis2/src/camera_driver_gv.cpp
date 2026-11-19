@@ -89,6 +89,8 @@ CameraDriverGv::CameraDriverGv(const rclcpp::NodeOptions& options) :
     p_tl_control_    = std::dynamic_pointer_cast<GenTransportLayerControl>(p_gv_tl_control_);
 
     CHECK_SUCCESS(setTransportLayerControlSettings(), logger_);
+    timestamp_source_ = timestampSource(get_parameter("timestamp_mode").as_string(),
+                                        p_gv_tl_control_->is_ptp_enable);
 
     //--- set image format control settings
     CHECK_SUCCESS(setImageFormatControlSettings(), logger_);

@@ -65,6 +65,7 @@ diagnostic_msgs::msg::DiagnosticStatus StreamCounters::describeInterval(
     const double fps = interval.count() > 0 ? published_delta / interval.count() : 0.0;
     addValue(status, "published_fps", fps);
     addValue(status, "dropped_frames", dropped);
+    addValue(status, "timestamp_drops", timestamp_drops);
 
     const bool transport_loss = failures > previous.failures ||
       underruns > previous.underruns || missing > previous.missing;
@@ -81,6 +82,12 @@ diagnostic_msgs::msg::DiagnosticStatus StreamCounters::describeInterval(
         status.message = "Idle";
     else
         status.message = published_delta ? "Streaming" : "Waiting for frames";
+    if (timestamp_drops > previous.timestamp_drops)
+    {
+        status.message = status.level == Status::WARN ?
+          status.message + " and timestamp drops" : "Timestamp drops";
+        status.level = Status::WARN;
+    }
     return status;
 }
 
@@ -94,6 +101,7 @@ StreamCounters CameraDriver::readStreamCounters(const Stream& stream)
                                      &counters.resent, &counters.missing);
     counters.published = stream.published_frames.load();
     counters.dropped = stream.dropped_frames.load();
+    counters.timestamp_drops = stream.timestamp_drops.load();
     return counters;
 }
 
@@ -124,6 +132,9 @@ void CameraDriver::publishStreamDiagnostics()
                 status = counters.describeInterval(stream.previous_counters, interval,
                                                    current_num_subscribers_ > 0,
                                                    ARV_IS_GV_STREAM(stream.p_arv_stream));
+                auto& source = status.values.emplace_back();
+                source.key = "timestamp_source";
+                source.value = timestampSourceName(timestamp_source_);
                 addValue(status, "processing_queue_depth", stream.buffer_queue.size());
                 addValue(status, "buffers_allocated", stream.p_buffer_pool->getAllocatedSize());
                 addValue(status, "buffer_limit", max_stream_buffers_);
@@ -146,7 +157,7 @@ void CameraDriver::printStreamStatistics() const
         RCLCPP_INFO_STREAM(logger_, "Statistics for " << stream.name
           << ": completed=" << counters.completed << " failures=" << counters.failures
           << " underruns=" << counters.underruns << " published=" << counters.published
-          << " dropped=" << counters.dropped);
+          << " dropped=" << counters.dropped << " timestamp_drops=" << counters.timestamp_drops);
         if (ARV_IS_GV_STREAM(stream.p_arv_stream))
             RCLCPP_INFO_STREAM(logger_, "Resent packets=" << counters.resent
               << " missing packets=" << counters.missing);
