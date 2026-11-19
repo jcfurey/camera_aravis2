@@ -26,6 +26,7 @@ It currently implements the gigabit ethernet and USB3 protocols used by industri
 
 - [Running the Camera Driver](#running-the-camera-driver)
     - [Configuration](#configuration)
+    - [Per-frame metadata](#per-frame-metadata)
     - [Automatic reconnect](#automatic-reconnect)
     - [Example Launch Files](#example-launch-files)
 - [Finding Available Cameras](#finding-available-cameras)
@@ -70,7 +71,7 @@ The configuration of the camera driver is divided into a driver-specific and Gen
     - Type: String-Array
     - Default: {}
     - Optional. If omitted, it is constructed from the camera GUID located within the current working directory, with the stream name separated by '_' appended to the file name, if more than one streams are instantiated.
-- `timestamp_mode` selects the clock for both Image and CameraInfo at startup. It uses the host or camera clock even when ROS simulated time is active.
+- `timestamp_mode` selects the ROS header clock for Image, CameraInfo and FrameMetadata at startup. It uses the host or camera clock even when ROS simulated time is active.
     - `auto` (default) uses device time when the GigE camera reports PTP enabled at startup and host reception time otherwise. Enabling PTP alone does not establish clock lock or epoch agreement.
     - `host_receive` uses the host wall-clock timestamp Aravis records when receiving the buffer.
     - `device` forwards the camera's raw frame timestamp. The camera determines its epoch and it can jump after a clock reset.
@@ -221,6 +222,22 @@ While the parameters are evaluated by camera_aravis2 in the specific order which
 If a feature is omitted but supported by the camera, it will default to the value that is currently set on the device.
 
 To find the features that are available for configuration on the camera, together with their feature names and their value ranges, look into the documentation of the manufacturer or [extract the camera-specific GenICam XML file](#extracting-camera-specific-genicam-xml).
+
+### Per-frame metadata
+
+Each stream publishes `frame_metadata` alongside `image_raw` and `camera_info`.
+Match the three messages by their identical ROS header. The metadata contains the
+same hardware ID as the stream diagnostics, the Aravis transport frame ID, the
+device and host reception timestamps in nanoseconds, and the source PFNC pixel
+format before conversion to a ROS encoding. Both timestamps preserve the values
+returned by Aravis across ROS timestamp modes and offsets. A frame ID can wrap
+or reset when the camera restarts. [FrameMetadata message definition](camera_aravis2_msgs/msg/FrameMetadata.msg)
+
+On Kilted and Lyrical, subscribing to metadata alone starts acquisition. Removing
+the last subscriber to all frame topics stops it. The driver publishes metadata
+only for frames that pass the same buffer and timestamp checks as the image.
+To inspect a frame from the default GigE node, run
+`ros2 topic echo --once /camera_driver_gv/frame_metadata`.
 
 ### Automatic reconnect
 

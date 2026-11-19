@@ -67,6 +67,7 @@ extern "C"
 #include "camera_aravis2/image_buffer_pool.h"
 #include "camera_aravis2/stream_statistics.h"
 #include <camera_aravis2_msgs/msg/camera_diagnostics.hpp>
+#include <camera_aravis2_msgs/msg/frame_metadata.hpp>
 #include <camera_aravis2_msgs/srv/calculate_white_balance.hpp>
 
 namespace camera_aravis2
@@ -134,6 +135,8 @@ class CameraDriver : public CameraAravisNodeBase
 
         /// Camera info publisher.
         rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr p_camera_info_pub;
+
+        rclcpp::Publisher<camera_aravis2_msgs::msg::FrameMetadata>::SharedPtr p_frame_metadata_pub;
 
         /// Unique pointer to camera info manager.
         std::unique_ptr<camera_info_manager::CameraInfoManager> p_camera_info_manager;

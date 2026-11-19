@@ -339,8 +339,12 @@ bool CameraDriver::setupCameraStreamStructs()
 
         //--- camera_info is published by a separate publisher, so that its subscribers trigger
         //--- the matched event as well. The image_transport::CameraPublisher does not support that.
+        const std::string image_topic = stream.image_pub.getTopic();
         stream.p_camera_info_pub = this->create_publisher<sensor_msgs::msg::CameraInfo>(
-          image_transport::getCameraInfoTopic(stream.image_pub.getTopic()), 10, pub_options);
+          image_transport::getCameraInfoTopic(image_topic), 10, pub_options);
+        const std::string stream_namespace = image_topic.substr(0, image_topic.rfind('/') + 1);
+        stream.p_frame_metadata_pub = create_publisher<camera_aravis2_msgs::msg::FrameMetadata>(
+          stream_namespace + "frame_metadata", 10, pub_options);
 
         //--- initialize camera_info manager
         // NOTE: Previously, separate node handles where used for CameraInfoManagers in case of a
@@ -1211,12 +1215,14 @@ void CameraDriver::handleMessageSubscriptionChange()
         return;
 
 #ifdef WITH_MATCHED_EVENTS
-    //--- get the maximum number of image and camera_info subscribers over all streams
+    // Any subscriber to a frame topic requests acquisition for the camera.
     size_t new_num_subscribers = 0;
     for (const Stream& stream : streams_)
         new_num_subscribers =
           std::max({new_num_subscribers, stream.image_pub.getNumSubscribers(),
-                    stream.p_camera_info_pub->get_subscription_count()});
+                    stream.p_camera_info_pub->get_subscription_count(),
+                    stream.p_frame_metadata_pub->get_subscription_count(),
+                    stream.p_frame_metadata_pub->get_intra_process_subscription_count()});
 #else
     //--- without matched events the acquisition is always kept running
     const size_t new_num_subscribers = 1;
@@ -1912,6 +1918,8 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
     RCLCPP_INFO(logger_, "Started processing thread for stream %i (%s)", stream_id,
                 stream.name.c_str());
 
+    camera_aravis2_msgs::msg::FrameMetadata metadata;
+    metadata.hardware_id = hardware_id_;
     while (true)
     {
         //--- pop buffer pointer from queue, blocking if no item is available
@@ -1959,6 +1967,13 @@ void CameraDriver::processStreamBuffer(const uint stream_id)
         //--- publish
         stream.image_pub.publish(*p_img_msg);
         stream.p_camera_info_pub->publish(*stream.p_cam_info_msg);
+        // buffer_img_pair retains the original receive buffer even after image conversion.
+        metadata.header = p_img_msg->header;
+        metadata.frame_id = arv_buffer_get_frame_id(p_arv_buffer);
+        metadata.device_timestamp_ns = arv_buffer_get_timestamp(p_arv_buffer);
+        metadata.host_receive_timestamp_ns = arv_buffer_get_system_timestamp(p_arv_buffer);
+        metadata.pixel_format = arv_buffer_get_image_pixel_format(p_arv_buffer);
+        stream.p_frame_metadata_pub->publish(metadata);
 
         ++stream.published_frames;
 
